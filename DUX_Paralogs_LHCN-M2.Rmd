@@ -1,0 +1,1484 @@
+---
+title: "DUX Paralog Analysis in LHCN-M2 Cells by RNA-seq"
+author: "Micah Gearhart"
+output: github_document
+date: "09-7-21"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r libraries,eval=T,results='hide',message=FALSE,warning=FALSE}
+library("magrittr")
+library("dplyr")
+library("stringr")
+library("ggplot2")
+library("DESeq2")
+library("ComplexHeatmap")
+library("GenomicFeatures")
+library("rtracklayer")
+library("GenomicRanges")
+library("ComplexHeatmap")
+library("Biostrings")
+library("googlesheets4")
+library("VennDiagram")
+library("gridExtra")
+library("eulerr")
+library("tximport")
+library("writexl")
+
+ts<-format(Sys.time(), "%a_%b_%d_%Y_%H%M")
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+options("scipen"=2, "digits"=4)
+```
+
+# Visualize As FPKM
+```{r}
+plot_fpkm<-function(x="ENSG00000180532",d=dds2,bar=F) {
+  if (substr(x,1,4)=="ENSG") {
+    symbol<-mcols(d)[grep(x,mcols(d)$gene_id),"gene_name"]
+    title<-paste0(symbol,": ",x)
+  } else {
+    x<-toupper(x)
+    symbol<-x
+    x<-rownames(mcols(d)[grep(paste0("^",x,"$"),mcols(d)$gene_name),])
+    title<-paste0(symbol,": ",x)
+  }
+
+if (!bar) {
+  return(
+    data.frame(f=fpkm(d,robust=T)[x,],cond=colData(d)$cond,paralog=colData(d)$paralog,name=colData(d)$names) %>%
+    dplyr::mutate(log2fpkm=log2(f+1)) %>%
+    dplyr::mutate(rep=str_sub(name,-1,-1)) %>% 
+    ggplot(aes(x=cond,y=log2fpkm,color=cond,label=rep)) + geom_point(size=2) +
+    stat_summary(fun = mean, fun.min = mean, fun.max = mean,
+                 geom = "crossbar", width = 0.35,size=0.4) +
+    #ggrepel::geom_text_repel() + 
+    theme_minimal() +  ggtitle(title) +
+    xlab("") + ylab("Log2 Normalized FPKM") +
+    scale_color_manual(values=cbPalette[c(4,2,2)]) +
+     facet_wrap(~paralog,nrow = 1,scales = "free_x") +
+    expand_limits(x=0, y = 0) +
+    theme(legend.position="none") + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+    )
+}
+
+if (bar) {
+    df<-data.frame(f=fpkm(d,robust=T)[x,],cond=colData(d)$cond,paralog=colData(d)$paralog,name=colData(d)$names) %>%
+          dplyr::mutate(log2fpkm=log2(f+1))
+  return(
+    df %>%
+    group_by(cond,paralog) %>%
+      summarize(mean=mean(log2fpkm),se=sd(log2fpkm)/sqrt(n())) %>%
+      ungroup %>% 
+    ggplot(aes(x=cond, y=mean,fill=cond)) +
+    geom_bar(stat = "identity",position = "dodge",color="black",width=0.8) + ggtitle(title) +
+    geom_errorbar(aes(ymin=mean,ymax = mean+se), position = "dodge", width = 0.8) +
+      geom_point(data=df,aes(x=cond,y=log2fpkm,fill=cond),color="black",position = position_jitter(w = 0.15, h = 0))+
+    xlab("") + ylab("Log2( Normalized FPKM + 1 )") + theme_bw() +
+    scale_fill_manual(values=cbPalette[c(4,2,2)]) +
+    scale_color_manual(values=cbPalette[c(4,2,2)]) +
+    facet_wrap(~paralog,nrow = 1,scales = "free_x") +
+    theme(legend.position="none") + theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+    expand_limits(x=0, y = 0)
+  )
+
+}
+}
+
+
+
+```
+
+```{r download_sampletable,eval=F}
+workbook_url<-"https://docs.google.com/spreadsheets/d/1jUMAIG0MF2fmDuvp99O1xNtLogQXN-vZegE0W2eEFls/edit#gid=0"
+(sheet_names<-sheet_names(workbook_url))
+samples<-as.data.frame(read_sheet(workbook_url,sheet=sheet_names[1],col_names=T))
+samples$name<-gsub("_R1_001.fastq.gz","",samples$`raw file...11`)
+save(samples,file="lrh1_samples.rdata")
+```
+
+```{r download_annotations,eval=F}
+#Download one of the following
+#download.file("http://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_38/gencode.v38.chr_patch_hapl_scaff.annotation.gff3.gz",
+#destfile="gencode.v38.chr_patch_hapl_scaff.annotation.gff3.gz")
+
+#point to file downloaded above
+gff3_file<-"../../R_RESOURCES/gencode.v38.chr_patch_hapl_scaff.annotation.gtf.gz"
+txdb<-makeTxDbFromGFF(gff3_file,format="gtf")
+#get symbols and biotypes from gff3 file that is not in txdb
+V38<-import(gff3_file,format="gtf")
+symbols<-as.data.frame(mcols(V38))
+symbols<-symbols[symbols$type=="gene",c("gene_id","gene_name","gene_type")]
+symbols$chr<-as.character(seqnames(V38[match(symbols$gene_id,V38$gene_id)]))
+#symbols$gene_id<-substr(symbols$gene_id,1,15)
+head(table(symbols$chr),30)
+
+transcripts<-transcripts(txdb,columns=c("gene_id","tx_name"))
+#transcripts$gene_id<-substr(unlist(transcripts$gene_id),1,15)
+transcripts$gene_id<-unlist(transcripts$gene_id)
+names(transcripts)<-transcripts$tx_name
+mcols(transcripts)<-data.frame(gene_id=transcripts$gene_id,stringsAsFactors = F)
+transcripts$symbol<-symbols$gene_name[match(transcripts$gene_id,symbols$gene_id)]
+transcripts$biotype<-symbols$gene_type[match(transcripts$gene_id,symbols$gene_id)]
+el_hg38<-import("~/Documents/Notebook/GCD/R_RESOURCES/ENCFF356LFX.bed.gz")
+#save(symbols,transcripts,el_hg38,file="symbols_hg38.rdata")
+
+```
+
+# Load Data and Annotations
+```{r old_version,eval=F}
+#load("symbols_hg38.rdata")
+load("kybam_z_v38_q0_Mon_Jan_31_2022_2056.rdata") 
+
+
+coldata<-as.data.frame(apply(unstranded_unfiltered$counts,2,sum))
+colnames(coldata)<-"total_counts"
+coldata$sample_name<-rownames(coldata) %>% 
+  gsub("\\.Aligned\\.out\\.sort\\.bam\\.repair","",.)
+
+
+dds<-DESeqDataSetFromMatrix(unstranded_unfiltered$counts,colData = coldata,design = ~1)
+mcols(dds)$basepairs<-unstranded_counts$annotation$Length
+#rownames(dds)<-substr(rownames(dds),1,15)
+mcols(dds)$gene_id<-rownames(dds)
+mcols(dds)<-dplyr::full_join(as.data.frame(mcols(dds)),symbols)
+colnames(dds)<-colnames(dds) %>% gsub("\\.Aligned\\.out\\.sort\\.bam\\.repair","",.)
+
+```
+
+# New symbols
+```{r download_annotations,eval=F}
+#Download one of the following
+#download.file("http://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_38/gencode.v38.chr_patch_hapl_scaff.annotation.gff3.gz",
+#destfile="gencode.v38.chr_patch_hapl_scaff.annotation.gff3.gz")
+
+#point to file downloaded above
+gff3_file<-"../../R_RESOURCES/gencode.v38.annotation.gtf.gz"
+txdb<-makeTxDbFromGFF(gff3_file,format="gtf")
+#get symbols and biotypes from gff3 file that is not in txdb
+V38<-rtracklayer::import(gff3_file,format="gtf")
+symbols<-as.data.frame(mcols(V38))
+symbols<-symbols[symbols$type=="gene",c("gene_id","gene_name","gene_type")]
+symbols$chr<-as.character(seqnames(V38[match(symbols$gene_id,V38$gene_id)]))
+symbols<-symbols[!duplicated(symbols$gene_id),]
+sum(duplicated(symbols$gene_id))
+symbols$gene_id<-substr(symbols$gene_id,1,15)
+sum(duplicated(symbols$gene_id))
+symbols<-symbols[!duplicated(symbols$gene_id),]
+sum(duplicated(symbols$gene_id))
+
+#symbols$gene_id<-substr(symbols$gene_id,1,15)
+head(table(symbols$chr),30)
+
+transcripts<-transcripts(txdb,columns=c("gene_id","tx_name"))
+#transcripts$gene_id<-substr(unlist(transcripts$gene_id),1,15)
+transcripts$gene_id<-unlist(transcripts$gene_id)
+transcripts$gene_id<-substr(transcripts$gene_id,1,15)
+names(transcripts)<-transcripts$tx_name
+mcols(transcripts)<-data.frame(gene_id=transcripts$gene_id,stringsAsFactors = F)
+transcripts$symbol<-symbols$gene_name[match(transcripts$gene_id,symbols$gene_id)]
+transcripts$biotype<-symbols$gene_type[match(transcripts$gene_id,symbols$gene_id)]
+el_hg38<-import("~/Documents/Notebook/GCD Consultant/R_RESOURCES/ENCFF356LFX.bed.gz")
+#save(symbols,transcripts,el_hg38,file="symbols_hg38.rdata")
+
+```
+
+# Switch to Salmon Counts
+```{r}
+
+
+data.dir<-"salmon"
+coldata<-data.frame(names=gsub("\\.gcbias","",list.files(data.dir)))
+coldata$files<- file.path(data.dir, list.files(data.dir), "quant.sf")
+file.exists(coldata$files)
+
+# generate tx2gene
+x<-read.table(coldata$files[1],header=T)
+x<-x$Name
+tx2gene<-data.frame(TXNAME=sapply(str_split(x,"\\|"),function(x) x[1]),GENEID=sapply(str_split(x,"\\|"),function(x) x[2]))
+
+
+#update symbols
+tail(symbols)
+symbols<-rbind(symbols,data.frame(gene_id="ENSG00099999999",gene_name="SDUX",gene_type="protein_coding",chr="chrS"))
+tail(symbols)
+
+files<-coldata$files
+names<-gsub("salmon\\/","",coldata$files) %>% gsub(".gcbias\\/quant.sf","",.) %>%
+  gsub("DUXA-VP64","DUXAVP64",.)
+#names<-sapply(strsplit(names,"_"),function(x) x[1])
+names(files)<-names
+
+txi <- tximport(files, type = "salmon", tx2gene = tx2gene,ignoreAfterBar = TRUE)
+tail(txi$counts)
+colnames(txi)
+rownames(coldata) <- colnames(txi$counts)
+
+
+coldata$cond<-factor(ifelse(str_detect(coldata$names,"dox"),"dox","cont"),levels=c("cont","dox"))
+coldata$paralog<-factor(case_when(
+   str_detect(coldata$names,"DUX4")  ~ "DUX4",
+   str_detect(coldata$names,"DUXA-VP64")  ~ "DUXA_VP64",
+   str_detect(coldata$names,"DUXA")  ~ "DUXA",
+   str_detect(coldata$names,"DUXB")  ~ "DUXB",
+   str_detect(coldata$names,"sDUX")  ~ "sDUX",
+  TRUE ~ "huh?"
+),levels=c("DUX4","DUXA","DUXA_VP64","DUXB","sDUX"))
+
+coldata$group<-factor(paste0(coldata$paralog,"_",coldata$cond),
+                      levels=c("DUX4_cont","DUX4_dox",
+                               "DUXA_cont","DUXA_dox",
+                               "DUXA_VP64_cont","DUXA_VP64_dox",
+                               "DUXB_cont","DUXB_dox",
+                               "sDUX_cont","sDUX_dox"))
+
+dds2 <- DESeqDataSetFromTximport(txi, coldata, ~group)
+#colData(dds2<-dds2[,!str_detect(colnames(dds),"HoxB4")])
+rownames(dds2)<-substr(rownames(dds2),1,15)
+
+mcols(dds2)$gene_name<-symbols[match(rownames(dds2),symbols$gene_id),"gene_name"]
+mcols(dds2)$gene_type<-symbols[match(rownames(dds2),symbols$gene_id),"gene_type"]
+mcols(dds2)$chr<-symbols[match(rownames(dds2),symbols$gene_id),"chr"]
+tail(mcols(dds2))
+
+
+dds2<-estimateSizeFactors(dds2)
+dds2_p1<-DESeq2:::plotPCA.DESeqTransform(normTransform(dds2),intgroup=c("cond","paralog"),ntop=500, returnData=T)
+
+#pdf(paste0("DUX_Paralog_PCA_",ts,".pdf"),width=10,height=6)
+svglite::svglite(paste0("DUX_Paralog_PCA_",ts,".svg"),width=9,height=8)
+dds2_p1 %>% 
+  dplyr::mutate(paralog=factor(paralog,levels=c("sDUX","DUX4","DUXA_VP64","DUXA","DUXB"))) %>% 
+ggplot(aes(x=PC1,y=PC2,color=paralog,shape=cond,label=paralog)) +
+         geom_point(size=3) + 
+         ggtitle("LHCN-M2 DUX Paralogs PCA") +
+         xlab(paste0("PC1: ",round(100*attr(dds_lhcnm2_p1,"percentVar")[1],0) ,"% variance")) + 
+         ylab(paste0("PC2: ",round(100*attr(dds_lhcnm2_p1,"percentVar")[2],0) ,"% variance")) + 
+         ggrepel::geom_text_repel(size=6) + 
+         scale_color_manual(values=cbPalette[c(3,4,7,2,8)]) +
+         scale_shape_manual(values = c(21,19)) +
+         theme_bw() 
+dev.off()
+
+```
+
+
+# LHCN-M2 Samples
+```{r}
+#as.data.frame(colData(dds_lhcnm2<-dds[,str_detect(colData(dds)$sample_name,"LHCN")]) )
+as.data.frame(colData(dds_lhcnm2<-dds2[,str_detect(colData(dds2)$names,"LHCN")]) )
+#colData(dds_lhcnm2)$cond<-factor(ifelse(str_detect(colData(dds_lhcnm2)$sample_name,"dox"),"dox","cont"),levels=c("cont","dox"))
+#colData(dds_lhcnm2)$paralog<-factor(case_when(
+#   str_detect(colData(dds_lhcnm2)$sample_name,"DUX4")  ~ "DUX4",
+#   str_detect(colData(dds_lhcnm2)$sample_name,"DUXA-VP64")  ~ "DUXA_VP64",
+#   str_detect(colData(dds_lhcnm2)$sample_name,"DUXA")  ~ "DUXA",
+#   str_detect(colData(dds_lhcnm2)$sample_name,"DUXB")  ~ "DUXB",
+#   str_detect(colData(dds_lhcnm2)$sample_name,"sDUX")  ~ "sDUX",
+#  TRUE ~ "huh?"
+#),levels=c("DUX4","DUXA","DUXA_VP64","DUXB","sDUX"))
+
+dds_lhcnm2<-estimateSizeFactors(dds_lhcnm2)
+dds_lhcnm2_p1<-DESeq2:::plotPCA.DESeqTransform(normTransform(dds_lhcnm2),intgroup=c("cond","paralog"),ntop=500, returnData=T)
+
+#pdf(paste0("DUX_Paralog_PCA_",ts,".pdf"),width=10,height=6)
+dds_lhcnm2_p1 %>% 
+ggplot(aes(x=PC1,y=PC2,color=cond,label=paralog)) +
+         geom_point() + 
+         ggtitle("LHCN-M2 DUX Paralogs PCA") +
+         xlab(paste0("PC1: ",round(100*attr(dds_lhcnm2_p1,"percentVar")[1],0) ,"% variance")) + 
+         ylab(paste0("PC2: ",round(100*attr(dds_lhcnm2_p1,"percentVar")[2],0) ,"% variance")) + 
+         ggrepel::geom_text_repel() + 
+         scale_color_manual(values=cbPalette[c(2,4)]) +
+         theme_bw() 
+
+#dev.off()
+```
+
+#FPKM table
+```{r}
+f_lhcnm2 <- fpkm(dds_lhcnm2,robust=TRUE)
+
+f_mean_lhcnm2 <- f_lhcnm2 %>% as.data.frame() %>%
+  tibble::rownames_to_column(var="gene_id") %>%
+  tidyr::gather(sample,fpkm,-gene_id) %>%
+  dplyr::mutate(group=paste0(colData(dds_lhcnm2)[sample,]$paralog,colData(dds_lhcnm2)[sample,]$cond)) %>%
+  dplyr::group_by(gene_id,group) %>%
+    dplyr::summarize(mean_fpkm=round(mean(fpkm),3)) %>%
+    #dplyr::summarize(mean_fpkm=round(log2(mean(fpkm)+0.5),3)) %>%
+    dplyr::ungroup() %>%
+  dplyr::select(gene_id,group,mean_fpkm) %>%
+  tidyr::spread(group,mean_fpkm) %>%  as.data.frame()
+
+
+#sanity check
+subset(f_mean_lhcnm2,gene_id==rownames(mcols(dds_lhcnm2)[grep("ZSCAN4",mcols(dds_lhcnm2)$gene_name),]))
+subset(f_mean_lhcnm2,gene_id==rownames(mcols(dds_lhcnm2)[grep("PRAMEF12",mcols(dds_lhcnm2)$gene_name),]))
+subset(f_mean_lhcnm2,gene_id==rownames(mcols(dds_lhcnm2)[grep("^TRIM43$",mcols(dds_lhcnm2)$gene_name),]))
+subset(f_mean_lhcnm2,gene_id==rownames(mcols(dds_lhcnm2)[grep("^DUX4$",mcols(dds_lhcnm2)$gene_name),]))
+subset(f_mean_lhcnm2,gene_id==rownames(mcols(dds_lhcnm2)[grep("^SDUX$",mcols(dds_lhcnm2)$gene_name),]))
+  
+
+f_mean_lhcnm2 %>% left_join(symbols) %>% 
+  dplyr::filter(str_detect(gene_name,"DUX")) %>% 
+  dplyr::filter(rowSums(across(DUX4cont:sDUXdox)) > 0)  %>%
+  dplyr::arrange(rowSums(across(DUX4cont:sDUXdox)))
+
+
+#Export FPKMs for GEO
+head(LHCNM2_12hr_FPKM<-f_lhcnm2 %>%  as.data.frame() %>% 
+  tibble::rownames_to_column(var="gene_id") %>% left_join(symbols) %>%
+  dplyr::filter(rowSums(across(`LHCN-DUX4-43e-cont1`:`LHCN-sDUX-29e-dox12h2`)) > 0.0001)  %>%
+  dplyr::select(gene_id,gene_name,`LHCN-DUX4-43e-cont1`:`LHCN-sDUX-29e-dox12h2`) %>% 
+  dplyr::rename("Gene ID" = gene_id, "Gene Symbol" = gene_name,
+    "FPKM DUX4 control rep1" = `LHCN-DUX4-43e-cont1`,
+    "FPKM DUX4 control rep2" = `LHCN-DUX4-44e-cont2`,
+    "FPKM DUX4 dox12hr rep1" = `LHCN-DUX4-46e-dox12h2`,
+    "FPKM DUX4 dox12hr rep2" = `LHCN-DUX4-47e-dox12h1`,
+    "FPKM DUXA control rep1" = `LHCN-DUXA-1e-cont1`,
+    "FPKM DUXA control rep2" = `LHCN-DUXA-2e-cont2`,
+    "FPKM DUXA dox12hr rep1" = `LHCN-DUXA-4e-dox12h1`,
+    "FPKM DUXA dox12hr rep2" = `LHCN-DUXA-5e-dox12h2`,
+    "FPKM DUXA-VP64 control rep1" = `LHCN-DUXAVP64-10e-dox12h1`,
+    "FPKM DUXA-VP64 control rep2" = `LHCN-DUXAVP64-11e-dox12h2`,
+    "FPKM DUXA-VP64 dox12hr rep1" = `LHCN-DUXAVP64-7e-cont1`,
+    "FPKM DUXA-VP64 dox12hr rep2" = `LHCN-DUXAVP64-8e-cont2`,
+    "FPKM DUXB control rep1" = `LHCN-DUXB-13e-cont1`,
+    "FPKM DUXB control rep2" = `LHCN-DUXB-14e-cont2`,
+    "FPKM DUXB dox12hr rep1" = `LHCN-DUXB-16e-dox12h1`,
+    "FPKM DUXB dox12hr rep2" = `LHCN-DUXB-17e-dox12h2`,
+    "FPKM sDUX control rep1" = `LHCN-sDUX-25e-cont1`,
+    "FPKM sDUX control rep2" = `LHCN-sDUX-26e-cont2`,
+    "FPKM sDUX dox12hr rep1" = `LHCN-sDUX-28e-dox12h1`,
+    "FPKM sDUX dox12hr rep2" = `LHCN-sDUX-29e-dox12h2` ))
+
+
+head(LHCNM2_12hr_counts<-counts(dds_lhcnm2) %>%  as.data.frame() %>% 
+  tibble::rownames_to_column(var="gene_id") %>% left_join(symbols) %>%
+  dplyr::filter(rowSums(across(`LHCN-DUX4-43e-cont1`:`LHCN-sDUX-29e-dox12h2`)) > 0.1)  %>%
+  dplyr::select(gene_id,gene_name,`LHCN-DUX4-43e-cont1`:`LHCN-sDUX-29e-dox12h2`) %>% 
+  dplyr::rename("Gene ID" = gene_id, "Gene Symbol" = gene_name,
+    "Raw Counts DUX4 control rep1" = `LHCN-DUX4-43e-cont1`,
+    "Raw Counts DUX4 control rep2" = `LHCN-DUX4-44e-cont2`,
+    "Raw Counts DUX4 dox12hr rep1" = `LHCN-DUX4-46e-dox12h2`,
+    "Raw Counts DUX4 dox12hr rep2" = `LHCN-DUX4-47e-dox12h1`,
+    "Raw Counts DUXA control rep1" = `LHCN-DUXA-1e-cont1`,
+    "Raw Counts DUXA control rep2" = `LHCN-DUXA-2e-cont2`,
+    "Raw Counts DUXA dox12hr rep1" = `LHCN-DUXA-4e-dox12h1`,
+    "Raw Counts DUXA dox12hr rep2" = `LHCN-DUXA-5e-dox12h2`,
+    "Raw Counts DUXA-VP64 control rep1" = `LHCN-DUXAVP64-10e-dox12h1`,
+    "Raw Counts DUXA-VP64 control rep2" = `LHCN-DUXAVP64-11e-dox12h2`,
+    "Raw Counts DUXA-VP64 dox12hr rep1" = `LHCN-DUXAVP64-7e-cont1`,
+    "Raw Counts DUXA-VP64 dox12hr rep2" = `LHCN-DUXAVP64-8e-cont2`,
+    "Raw Counts DUXB control rep1" = `LHCN-DUXB-13e-cont1`,
+    "Raw Counts DUXB control rep2" = `LHCN-DUXB-14e-cont2`,
+    "Raw Counts DUXB dox12hr rep1" = `LHCN-DUXB-16e-dox12h1`,
+    "Raw Counts DUXB dox12hr rep2" = `LHCN-DUXB-17e-dox12h2`,
+    "Raw Counts sDUX control rep1" = `LHCN-sDUX-25e-cont1`,
+    "Raw Counts sDUX control rep2" = `LHCN-sDUX-26e-cont2`,
+    "Raw Counts sDUX dox12hr rep1" = `LHCN-sDUX-28e-dox12h1`,
+    "Raw Counts sDUX dox12hr rep2" = `LHCN-sDUX-29e-dox12h2` ))
+
+writexl::write_xlsx(list(LHCNM2_12hr_counts,LHCNM2_12hr_FPKM),"LHCN-M2_Counts_and_FPKM_for_12hr_DOX_induction.xlsx")
+
+rownames(colData(dds_lhcnm2)) <- gsub("FPKM ","",colnames(LHCNM2_12hr_FPKM)[3:22])
+colData(dds_lhcnm2)
+save(dds_lhcnm2,file="LHCNM2_12hr_DESeqDataSet.rdata")
+  
+
+#Export Mean FPKMs for Supplemental Data
+head(temp<-f_mean_lhcnm2 %>% left_join(symbols) %>% 
+  dplyr::filter(rowSums(across(DUX4cont:sDUXdox)) > 0)  %>%
+  dplyr::select(gene_id,gene_name,DUX4cont:sDUXdox) %>% 
+  dplyr::rename("Gene ID" = gene_id, "Gene Symbol" = gene_name,
+                "Mean FPKM DUX4 Control" = DUX4cont,
+                "Mean FPKM DUX4 Plus Dox" = DUX4dox,
+                "Mean FPKM DUXA Control" = DUXAcont,
+                "Mean FPKM DUXA Plus Dox" = DUXAdox,
+                "Mean FPKM DUXA-VP64 Control" = DUXA_VP64cont,
+                "Mean FPKM DUXA-VP64 Dox" =  DUXA_VP64dox,
+                "Mean FPKM DUXB Control" = DUXBcont,
+                "Mean FPKM DUXB Plus Dox" = DUXBdox,
+                "Mean FPKM sDUX Control" = sDUXcont,
+                "Mean FPKM sDUX Plus Dox" = sDUXdox))
+
+write.csv(temp,file=paste0("DUX_Paralogs_Mean_FPKM_values_",ts,".csv"),quote=F,row.names = F)
+
+
+head(counts)
+```
+
+
+```{r}
+svglite::svglite(paste0("ZSCAN4_",ts,".svg"),width=5,height=3)
+plot_fpkm("ZSCAN4",d=dds_lhcnm2,bar=T)
+dev.off()
+
+svglite::svglite(paste0("PRAMEF12_",ts,".svg"),width=5,height=3)
+plot_fpkm("PRAMEF12",d=dds_lhcnm2,bar=T)
+dev.off()
+```
+
+# Global looksy
+```{r global_looksy,eval=F}
+design(dds_lhcnm2)<- ~paralog + cond
+dds_lhcnm2<-DESeq(dds_lhcnm2)
+#plotMA(dds_lhcnm2)
+resultsNames(dds_lhcnm2)
+summary(res<-results(dds_lhcnm2))
+res<-as.data.frame(res) %>% tibble::rownames_to_column(var="gene_id")
+res<- res %>% left_join(symbols)
+#View(res)
+
+
+mean(na.omit(dispersions(dds_lhcnm2)))
+DESeq2::plotDispEsts(dds_lhcnm2)
+head(coef.mat<-coef(dds_lhcnm2))  #https://support.bioconductor.org/p/88880/
+group.means <- 2^(coef.mat[,1] + coef.mat[,-1])
+(cv <- sd(na.omit(group.means)) / mean(na.omit(group.means)) * 100)
+```
+
+# DUX4 
+```{r}
+as.data.frame(colData(dds_lhcnm2_DUX4<-dds_lhcnm2[,str_detect(colData(dds_lhcnm2)$names,"DUX4")]) )
+dds_lhcnm2_DUX4<-estimateSizeFactors(dds_lhcnm2_DUX4)
+dds_lhcnm2_DUX4$paralog<-droplevels(dds_lhcnm2_DUX4$paralog)
+design(dds_lhcnm2_DUX4)<- ~cond
+dds_lhcnm2_DUX4<-DESeq(dds_lhcnm2_DUX4)
+summary(res_DUX4<-results(dds_lhcnm2_DUX4))
+res_DUX4<-as.data.frame(res_DUX4) %>% tibble::rownames_to_column(var="gene_id") %>% 
+  left_join(symbols) %>% 
+  left_join(f_mean_lhcnm2[,c("gene_id","DUX4cont","DUX4dox")])
+deg_DUX4<-subset(res_DUX4,abs(res_DUX4$log2FoldChange) > 1 & res_DUX4$padj < 0.05 &
+        (res_DUX4$DUX4cont > 2.5 | res_DUX4$DUX4dox > 2.5))$gene_id
+table((res_DUX4$deg_DUX4 <- res_DUX4$gene_id %in% deg_DUX4),useNA="always")
+
+
+
+
+```
+
+# heatmap of Dux
+```{r}
+
+temp<-f_lhcnm2
+rownames(temp)<-substr(rownames(temp),1,15)
+mcols(dds_lhcnm2)[c("ENSG00000260596","ENSG00000258873","ENSG00000282757","ENSG00099999999"),]
+temp<-temp[c("ENSG00000260596","ENSG00000258873","ENSG00000282757","ENSG00099999999"),]
+temp<-log2(temp+1)
+
+rownames(temp)<-mcols(dds_lhcnm2)[match(rownames(temp),substr(rownames(dds_lhcnm2),1,15)),"gene_name"]
+temp
+temp<-as.data.frame(t(scale(t(temp),center=T)))
+
+temp<-temp[,c("LHCN-DUX4-43e-cont1",
+"LHCN-DUX4-44e-cont2",
+"LHCN-DUX4-46e-dox12h2",
+"LHCN-DUX4-47e-dox12h1",   
+"LHCN-DUXA-1e-cont1",
+"LHCN-DUXA-2e-cont2",
+"LHCN-DUXA-4e-dox12h1",
+"LHCN-DUXA-5e-dox12h2",
+"LHCN-DUXAVP64-7e-cont1",
+"LHCN-DUXAVP64-8e-cont2",  
+"LHCN-DUXAVP64-10e-dox12h1",
+"LHCN-DUXAVP64-11e-dox12h2",
+"LHCN-DUXB-13e-cont1",
+"LHCN-DUXB-14e-cont2",
+"LHCN-DUXB-16e-dox12h1",
+"LHCN-DUXB-17e-dox12h2",   
+"LHCN-sDUX-25e-cont1",
+"LHCN-sDUX-26e-cont2",
+"LHCN-sDUX-28e-dox12h1",
+"LHCN-sDUX-29e-dox12h2")]
+
+temp<-as.matrix(temp)
+
+
+p_cutoff=0.0
+lfc_cutoff=log2(10)
+nrow(temp_res1<-subset(res_DUX4,deg_DUX4 & padj<= p_cutoff & abs(log2FoldChange) > lfc_cutoff & !str_detect(gene_type,"pseudogene") & str_detect(chr,"chr")))
+nrow(temp_res2<-subset(res_DUXA,deg_DUXA & padj<= p_cutoff & abs(log2FoldChange) > lfc_cutoff & !str_detect(gene_type,"pseudogene") & str_detect(chr,"chr")))
+nrow(temp_res3<-subset(res_DUXA_VP64,deg_DUXA_VP64 & padj<= p_cutoff & abs(log2FoldChange) > lfc_cutoff & !str_detect(gene_type,"pseudogene") & str_detect(chr,"chr")))
+nrow(temp_res4<-subset(res_DUXB, deg_DUXB & padj<= p_cutoff & abs(log2FoldChange) > lfc_cutoff & !str_detect(gene_type,"pseudogene") & str_detect(chr,"chr")))
+nrow(temp_res5<-subset(res_sDUX, deg_sDUX & padj<= p_cutoff & abs(log2FoldChange) > lfc_cutoff & !str_detect(gene_type,"pseudogene") & str_detect(chr,"chr")))
+
+length(temp_res<-unique(c(temp_res1$gene_id,temp_res2$gene_id,temp_res3$gene_id,temp_res4$gene_id,temp_res5$gene_id)))
+length(temp_res<-temp_res[!temp_res %in% c("ENSG00000258873","ENSG00000282757","ENSG00000260596","ENSG00099999999")])
+
+
+#temp_res<-subset(temp_res,!substr(gene_id,1,15) %in% c("ENSG00000258873","ENSG00000282757","ENSG00000260596"))
+#temp_res<-temp_res[with(temp_res,order(abs(log2FoldChange),decreasing=T)),]
+#temp_res<-head(temp_res,30)
+
+
+
+temp2<-f_lhcnm2
+temp2<-temp2[rownames(temp2) %in% temp_res,]
+rownames(temp2)<-mcols(dds_lhcnm2)[match(rownames(temp2),rownames(dds_lhcnm2),1,15),"gene_name"]
+temp2<-log2(temp2+1)
+
+temp2<-as.data.frame(t(scale(t(temp2),center=T)))
+
+temp2<-temp2[,c("LHCN-DUX4-43e-cont1",
+"LHCN-DUX4-44e-cont2",
+"LHCN-DUX4-46e-dox12h2",
+"LHCN-DUX4-47e-dox12h1",   
+"LHCN-DUXA-1e-cont1",
+"LHCN-DUXA-2e-cont2",
+"LHCN-DUXA-4e-dox12h1",
+"LHCN-DUXA-5e-dox12h2",
+"LHCN-DUXAVP64-7e-cont1",
+"LHCN-DUXAVP64-8e-cont2",  
+"LHCN-DUXAVP64-10e-dox12h1",
+"LHCN-DUXAVP64-11e-dox12h2",
+"LHCN-DUXB-13e-cont1",
+"LHCN-DUXB-14e-cont2",
+"LHCN-DUXB-16e-dox12h1",
+"LHCN-DUXB-17e-dox12h2",   
+"LHCN-sDUX-25e-cont1",
+"LHCN-sDUX-26e-cont2",
+"LHCN-sDUX-28e-dox12h1",
+"LHCN-sDUX-29e-dox12h2")]
+
+temp2<-as.matrix(temp2)
+
+col_fun = circlize::colorRamp2(c(min(c(temp,temp2)),0, max(c(temp,temp2))), c("blue","white", "red"))
+
+  pdf("Heatmap_padjzero_10fold.pdf",width=8.5,height=11)
+Heatmap(temp,cluster_columns = FALSE,cluster_rows = F,col=col_fun,
+        heatmap_legend_param = list(title = "Centered,\nScaled\nLog2\n(FPKM +1)")) %v% 
+  Heatmap(temp2,cluster_columns = F,cluster_rows = T,col=col_fun,show_heatmap_legend = F) 
+dev.off()
+
+
+
+```
+
+# 
+```{r}
+muscle_elife<-c("CDX2", "MSGN1", "GSC", "T", "MESP1", "TBX6", "PAX7", "CD271",
+"EYA2", "EVC", "MYF5", "TWIST1", "ZEB2", "SIX4", "PITX3", "MYF6", "MSTN", 
+"MYH1", "MYL2", "MYH2", "ITGB1", "TMEM182", "MEF2C",
+"MYH7", "MYOG", "MYOD1", "TTN", "DISTROPHIN", "RUNX1")
+
+
+temp3<-f_lhcnm2
+temp3<-temp3[rownames(temp3) %in% temp_res$gene_id,]
+rownames(temp2)<-mcols(dds_lhcnm2)[match(rownames(temp2),rownames(dds),1,15),"gene_name"]
+temp2<-log2(temp2+0.1)
+
+temp2<-as.data.frame(t(scale(t(temp2),center=T)))
+
+temp2<-temp2[,c("LHCN-DUX4-43e-cont1",
+"LHCN-DUX4-44e-cont2",
+"LHCN-DUX4-46e-dox12h2",
+"LHCN-DUX4-47e-dox12h1",   
+"LHCN-DUXA-1e-cont1",
+"LHCN-DUXA-2e-cont2",
+"LHCN-DUXA-4e-dox12h1",
+"LHCN-DUXA-5e-dox12h2",
+"LHCN-DUXA-VP64-7e-cont1",
+"LHCN-DUXA-VP64-8e-cont2",  
+"LHCN-DUXA-VP64-10e-dox12h1",
+"LHCN-DUXA-VP64-11e-dox12h2",
+"LHCN-DUXB-13e-cont1",
+"LHCN-DUXB-14e-cont2",
+"LHCN-DUXB-16e-dox12h1",
+"LHCN-DUXB-17e-dox12h2",   
+"LHCN-sDUX-25e-cont1",
+"LHCN-sDUX-26e-cont2",
+"LHCN-sDUX-28e-dox12h1",
+"LHCN-sDUX-29e-dox12h2")]
+
+temp2<-as.matrix(temp2)
+
+Heatmap(temp,cluster_columns = FALSE,cluster_rows = F) %v% 
+  Heatmap(temp2,cluster_columns = FALSE,cluster_rows = T) 
+
+```
+
+
+# DUXA 
+```{r}
+as.data.frame(colData(dds_lhcnm2_DUXA<-dds_lhcnm2[,str_detect(colData(dds_lhcnm2)$names,"DUXA") &
+                                                    !str_detect(colData(dds_lhcnm2)$names,"DUXA-VP64")]) )
+dds_lhcnm2_DUXA<-estimateSizeFactors(dds_lhcnm2_DUXA)
+dds_lhcnm2_DUXA$paralog<-droplevels(dds_lhcnm2_DUXA$paralog)
+design(dds_lhcnm2_DUXA)<- ~cond
+dds_lhcnm2_DUXA<-DESeq(dds_lhcnm2_DUXA)
+summary(res_DUXA<-results(dds_lhcnm2_DUXA))
+res_DUXA<-as.data.frame(res_DUXA) %>% tibble::rownames_to_column(var="gene_id") %>% 
+  left_join(symbols) %>% 
+  left_join(f_mean_lhcnm2[,c("gene_id","DUXAcont","DUXAdox")])
+
+deg_DUXA<-subset(res_DUXA, abs(res_DUXA$log2FoldChange) > 1 & res_DUXA$padj < 0.05 &
+        (res_DUXA$DUXAcont > 2.5 | res_DUXA$DUXAdox > 2.5))$gene_id
+table((res_DUXA$deg_DUXA <- res_DUXA$gene_id %in% deg_DUXA),useNA="always")
+
+mean(na.omit(dispersions(dds_lhcnm2_DUXA)))
+DESeq2::plotDispEsts(dds_lhcnm2_DUXA)
+head(coef.mat<-coef(dds_lhcnm2_DUXA))  #https://support.bioconductor.org/p/88880/
+group.means <- 2^(coef.mat[,1] + coef.mat[,-1])
+(cv <- sd(na.omit(group.means)) / mean(na.omit(group.means)) * 100)
+```
+
+# DUXA-VP64
+```{r}
+as.data.frame(colData(dds_lhcnm2_DUXA_VP64<-dds_lhcnm2[,str_detect(colData(dds_lhcnm2)$names,"DUXA-VP64")]) )
+dds_lhcnm2_DUXA_VP64<-estimateSizeFactors(dds_lhcnm2_DUXA_VP64)
+dds_lhcnm2_DUXA_VP64$paralog<-droplevels(dds_lhcnm2_DUXA_VP64$paralog)
+design(dds_lhcnm2_DUXA_VP64)<- ~cond
+dds_lhcnm2_DUXA_VP64<-DESeq(dds_lhcnm2_DUXA_VP64)
+summary(res_DUXA_VP64<-results(dds_lhcnm2_DUXA_VP64))
+res_DUXA_VP64<-as.data.frame(res_DUXA_VP64) %>% tibble::rownames_to_column(var="gene_id") %>% 
+  left_join(symbols) %>% 
+  left_join(f_mean_lhcnm2[,c("gene_id","DUXA_VP64cont","DUXA_VP64dox")])
+
+deg_DUXA_VP64 <- subset(res_DUXA_VP64,abs(res_DUXA_VP64$log2FoldChange) > 1 & res_DUXA_VP64$padj < 0.05 &
+        (res_DUXA_VP64$DUXA_VP64cont > 2.5 | res_DUXA_VP64$DUXA_VP64dox > 2.5))$gene_id
+table((res_DUXA_VP64$deg_DUXA_VP64 <- res_DUXA_VP64$gene_id %in% deg_DUXA_VP64),useNA="always")
+
+```
+
+# DUXB
+```{r}
+as.data.frame(colData(dds_lhcnm2_DUXB<-dds_lhcnm2[,str_detect(colData(dds_lhcnm2)$names,"DUXB")]) )
+dds_lhcnm2_DUXB<-estimateSizeFactors(dds_lhcnm2_DUXB)
+dds_lhcnm2_DUXB$paralog<-droplevels(dds_lhcnm2_DUXB$paralog)
+design(dds_lhcnm2_DUXB)<- ~cond
+dds_lhcnm2_DUXB<-DESeq(dds_lhcnm2_DUXB)
+summary(res_DUXB<-results(dds_lhcnm2_DUXB))
+res_DUXB<-as.data.frame(res_DUXB) %>% tibble::rownames_to_column(var="gene_id") %>% 
+  left_join(symbols) %>% 
+  left_join(f_mean_lhcnm2[,c("gene_id","DUXBcont","DUXBdox")])
+deg_DUXB <- subset(res_DUXB,abs(res_DUXB$log2FoldChange) > 1 & res_DUXB$padj < 0.05 &
+        (res_DUXB$DUXBcont > 2.5 | res_DUXB$DUXBdox > 2.5))$gene_id
+table((res_DUXB$deg_DUXB <- res_DUXB$gene_id %in% deg_DUXB),useNA="always")
+```
+
+# sDUX 
+```{r}
+as.data.frame(colData(dds_lhcnm2_sDUX<-dds_lhcnm2[,str_detect(colData(dds_lhcnm2)$names,"sDUX")]) )
+dds_lhcnm2_sDUX<-estimateSizeFactors(dds_lhcnm2_sDUX)
+dds_lhcnm2_sDUX$paralog<-droplevels(dds_lhcnm2_sDUX$paralog)
+design(dds_lhcnm2_sDUX)<- ~cond
+dds_lhcnm2_sDUX<-DESeq(dds_lhcnm2_sDUX)
+summary(res_sDUX<-results(dds_lhcnm2_sDUX))
+res_sDUX<-as.data.frame(res_sDUX) %>% tibble::rownames_to_column(var="gene_id") %>% 
+  left_join(symbols) %>% 
+  left_join(f_mean_lhcnm2[,c("gene_id","sDUXcont","sDUXdox")])
+deg_sDUX <- subset(res_sDUX, abs(res_sDUX$log2FoldChange) > 1 & res_sDUX$padj < 0.05 &
+        (res_sDUX$sDUXcont > 2.5 | res_sDUX$sDUXdox > 2.5))$gene_id
+
+table((res_sDUX$deg_sDUX <- res_sDUX$gene_id %in% deg_sDUX),useNA="always")
+```
+
+# Venn
+```{r}
+
+#svglite::svglite(paste0("DUX_Paralog_DEGs_Venn_",ts,".svg"),width=5,height=4.5)
+pdf(paste0("DUX_Paralog_DEGs_Venn_",ts,".pdf"),width=5,height=4.5)
+grid.newpage()
+VennDiagram::draw.quintuple.venn(area1=length(deg_DUX4),
+                            area2=length(deg_DUXA),
+                            area3=length(deg_DUXA_VP64),
+                            area4=length(deg_DUXB),
+                            area5=length(deg_sDUX),
+                            
+                            n12=length(intersect(deg_DUX4,deg_DUXA)),
+                            n13=length(intersect(deg_DUX4,deg_DUXA_VP64)),
+                            n14=length(intersect(deg_DUX4,deg_DUXB)),
+                            n15=length(intersect(deg_DUX4,deg_sDUX)),
+                            
+                            n23=length(intersect(deg_DUXA,deg_DUXA_VP64)),
+                            n24=length(intersect(deg_DUXA,deg_DUXB)),
+                            n25=length(intersect(deg_DUXA,deg_sDUX)),
+                              
+                            n34=length(intersect(deg_DUXA_VP64,deg_DUXB)),
+                            n35=length(intersect(deg_DUXA_VP64,deg_sDUX)),
+                            n45=length(intersect(deg_DUXB,deg_sDUX)),
+                            
+                            n123=length(intersect(intersect(deg_DUX4,deg_DUXA),deg_DUXA_VP64)),
+                            n124=length(intersect(intersect(deg_DUX4,deg_DUXA),deg_DUXB)),
+                            n125=length(intersect(intersect(deg_DUX4,deg_DUXA),deg_sDUX)),
+                            n134=length(intersect(intersect(deg_DUX4,deg_DUXA_VP64),deg_DUXB)),
+                            n234=length(intersect(intersect(deg_DUXA,deg_DUXA_VP64),deg_DUXB)),
+                            n235=length(intersect(intersect(deg_DUXA,deg_DUXA_VP64),deg_sDUX)),
+                            n245=length(intersect(intersect(deg_DUXA,deg_DUXB),deg_sDUX)),
+                            n345=length(intersect(intersect(deg_DUXA_VP64,deg_DUXB),deg_sDUX)),
+                            n145=length(intersect(intersect(deg_DUX4,deg_DUXB),deg_sDUX)),
+                            n135=length(intersect(intersect(deg_DUX4,deg_DUXA_VP64),deg_sDUX)),
+                            
+                            n1234=length(intersect(intersect(intersect(deg_DUX4,deg_DUXA),deg_DUXA_VP64),deg_DUXB)),
+                            n1345=length(intersect(intersect(intersect(deg_DUX4,deg_DUXA_VP64),deg_DUXB),deg_sDUX)),
+                            n1245=length(intersect(intersect(intersect(deg_DUX4,deg_DUXA),deg_DUXB),deg_sDUX)),
+                            n1235=length(intersect(intersect(intersect(deg_DUX4,deg_DUXA),deg_DUXA_VP64),deg_sDUX)),
+                            n2345=length(intersect(intersect(intersect(deg_DUXA,deg_DUXA_VP64),deg_DUXB),deg_sDUX)),
+                            
+                          n12345=length(intersect(intersect(intersect(intersect(deg_DUX4,deg_DUXA),deg_DUXA_VP64),deg_DUXB),deg_sDUX)),
+                            fill=cbPalette[c(3,5,7,8,6)],
+                            category=c("DUX4",
+                                       "DUXA",
+                                       "DUXA-VP64",
+                                       "DUXB",
+                                       "sDUX"))
+dev.off()
+
+```
+
+
+
+# Export results
+```{r}
+
+head(temp<-left_join(res_DUX4[,c("gene_id","gene_name","log2FoldChange","padj","DUX4cont","DUX4dox","deg_DUX4")],
+                res_DUXA[,c("gene_id","gene_name","log2FoldChange","padj","DUXAcont","DUXAdox","deg_DUXA")],
+                by=c("gene_id","gene_name"),suffix=c("_DUX4","_DUXA")) %>% 
+      left_join(res_DUXA_VP64[,c("gene_id","log2FoldChange","padj","DUXA_VP64cont","DUXA_VP64dox","deg_DUXA_VP64")]) %>% 
+           dplyr::rename("log2FoldChange_DUXA-VP64" = log2FoldChange,"padj_DUXA-VP64" = padj )  %>% 
+      left_join(res_DUXB[,c("gene_id","log2FoldChange","padj","DUXBcont","DUXBdox","deg_DUXB")]) %>%
+           dplyr::rename("log2FoldChange_DUXB" = log2FoldChange,"padj_DUXB" = padj )  %>% 
+      left_join(res_sDUX[,c("gene_id","log2FoldChange","padj","sDUXcont","sDUXdox","deg_sDUX")]) %>% 
+           dplyr::rename("log2FoldChange_sDUX" = log2FoldChange,"padj_sDUX" = padj )  %>% 
+       dplyr::filter(deg_DUX4 | deg_DUXA | deg_DUXA_VP64 | deg_DUXB | deg_sDUX) %>% 
+      dplyr::rename("Gene ID" = gene_id, "Gene Symbol" = gene_name,
+                "Mean FPKM DUX4 Control" = DUX4cont,
+                "Mean FPKM DUX4 Plus Dox" = DUX4dox,
+                "Mean FPKM DUXA Control" = DUXAcont,
+                "Mean FPKM DUXA Plus Dox" = DUXAdox,
+                "Mean FPKM DUXA-VP64 Control" = DUXA_VP64cont,
+                "Mean FPKM DUXA-VP64 Dox" =  DUXA_VP64dox,
+                "Mean FPKM DUXB Control" = DUXBcont,
+                "Mean FPKM DUXB Plus Dox" = DUXBdox,
+                "Mean FPKM sDUX Control" = sDUXcont,
+                "Mean FPKM sDUX Plus Dox" = sDUXdox))
+
+#write.csv(temp,file=paste0("DUX_Paralogs_DEGs_",ts,".csv"),quote=F,row.names = F) 
+
+dim(temp_dux4<-res_DUX4[,c("gene_id","gene_name","log2FoldChange","padj","DUX4cont","DUX4dox","deg_DUX4")] %>% 
+      dplyr::filter(deg_DUX4 ) %>% 
+      dplyr::select("Gene ID" = gene_id, "Gene Symbol" = gene_name,
+                "DUX4 Log2FC" = log2FoldChange, "DUX4 BH Adjusted P-Value" = padj,
+                "Mean FPKM DUX4 Control" = DUX4cont,
+                "Mean FPKM DUX4 Plus Dox" = DUX4dox))
+
+dim(temp_duxa<-res_DUXA[,c("gene_id","gene_name","log2FoldChange","padj","DUXAcont","DUXAdox","deg_DUXA")] %>% 
+      dplyr::filter(deg_DUXA ) %>% 
+      dplyr::select("Gene ID" = gene_id, "Gene Symbol" = gene_name,
+                "DUXA Log2FC" = log2FoldChange, "DUXA BH Adjusted P-Value"=padj,
+                "Mean FPKM DUXA Control" = DUXAcont,
+                "Mean FPKM DUXA Plus Dox" = DUXAdox))
+
+dim(temp_duxa_vp64<-res_DUXA_VP64[,c("gene_id","gene_name","log2FoldChange","padj","DUXA_VP64cont","DUXA_VP64dox","deg_DUXA_VP64")] %>% 
+      dplyr::filter(deg_DUXA_VP64 ) %>% 
+      dplyr::select("Gene ID" = gene_id, "Gene Symbol" = gene_name,
+                "DUXA_VP64 Log2FC" = log2FoldChange, "DUXA_VP64 BH Adjusted P-Value"=padj,
+                "Mean FPKM DUXA_VP64 Control" = DUXA_VP64cont,
+                "Mean FPKM DUXA_VP64 Plus Dox" = DUXA_VP64dox))
+
+dim(temp_duxb<-res_DUXB[,c("gene_id","gene_name","log2FoldChange","padj","DUXBcont","DUXBdox","deg_DUXB")] %>% 
+      dplyr::filter(deg_DUXB ) %>% 
+      dplyr::select("Gene ID" = gene_id, "Gene Symbol" = gene_name,
+                "DUXB Log2FC" = log2FoldChange, "DUXB BH Adjusted P-Value"=padj,
+                "Mean FPKM DUXB Control" = DUXBcont,
+                "Mean FPKM DUXB Plus Dox" = DUXBdox))
+
+dim(temp_sdux<-res_sDUX[,c("gene_id","gene_name","log2FoldChange","padj","sDUXcont","sDUXdox","deg_sDUX")] %>% 
+      dplyr::filter(deg_sDUX ) %>% 
+      dplyr::select("Gene ID" = gene_id, "Gene Symbol" = gene_name,
+                "sDUX Log2FC" = log2FoldChange, "sDUX BH Adjusted P-Value"=padj,
+                "Mean FPKM sDUX Control" = sDUXcont,
+                "Mean FPKM sDUX Plus Dox" = sDUXdox))
+writexl::write_xlsx(list(temp,temp_dux4,temp_duxa,temp_duxa_vp64,temp_duxb,temp_sdux),paste0("DUX_Paralogs_DEGs_",ts,".xlsx"))
+```
+
+
+# Update
+## can you determine what are the offset genes in LHCN-iDUX4 control (uninduced) by using uninduced samples from other cell lines? I wonder how DEG of other cell lines will look compared to the LHCN-iDUX4 uninduced cells.
+```{r}
+as.data.frame(colData(dds_lhcnm2_DUX4cont_v_DUXAcont<-dds_lhcnm2[,str_detect(colData(dds_lhcnm2)$sample_name,"DUX4|DUXA") &
+                                                                str_detect(colData(dds_lhcnm2)$cond,"cont") &
+                                                       !str_detect(colData(dds_lhcnm2)$sample_name,"VP64") ]) )
+dds_lhcnm2_DUX4cont_v_DUXAcont<-estimateSizeFactors(dds_lhcnm2_DUX4cont_v_DUXAcont)
+dds_lhcnm2_DUX4cont_v_DUXAcont$paralog<-droplevels(dds_lhcnm2_DUX4cont_v_DUXAcont$paralog)
+design(dds_lhcnm2_DUX4cont_v_DUXAcont)<- ~paralog
+dds_lhcnm2_DUX4cont_v_DUXAcont<-DESeq(dds_lhcnm2_DUX4cont_v_DUXAcont)
+summary(res_lhcnm2_DUX4cont_v_DUXAcont<-results(dds_lhcnm2_DUX4cont_v_DUXAcont,contrast = c("paralog","DUX4","DUXA")))
+
+res_lhcnm2_DUX4cont_v_DUXAcont<-as.data.frame(res_lhcnm2_DUX4cont_v_DUXAcont) %>% tibble::rownames_to_column(var="gene_id") %>% 
+  left_join(symbols) %>% 
+  left_join(f_mean_lhcnm2[,c("gene_id","DUXAcont","DUX4cont")])
+
+deg_DUX4cont_v_DUXAcont<-subset(res_lhcnm2_DUX4cont_v_DUXAcont,abs(log2FoldChange) > 1 & padj < 0.05 &
+        (DUXAcont > 2.5 | DUX4cont > 2.5))$gene_id
+
+table((res_lhcnm2_DUX4cont_v_DUXAcont$deg_DUX4cont_v_DUXAcont <- res_lhcnm2_DUX4cont_v_DUXAcont$gene_id %in% deg_DUX4cont_v_DUXAcont),useNA="always")
+
+temp2<-res_lhcnm2_DUX4cont_v_DUXAcont %>% 
+   dplyr::filter(deg_DUX4cont_v_DUXAcont) %>% 
+  dplyr::select(gene_id,gene_name,log2FoldChange,padj,DUX4cont,DUXAcont,gene_type,chr) %>% 
+  dplyr::arrange(padj) %>% 
+  dplyr::rename("Gene ID" = gene_id, "Gene Symbol" = gene_name,
+                "Mean FPKM DUX4 Control" = DUX4cont,
+                "Mean FPKM DUXA Control" = DUXAcont) 
+
+
+write.csv(temp2,file=paste0("DUX4cont_v_DUXAcont_",ts,".csv"),quote=F,row.names = F) 
+
+
+temp2_sorted_geneids<-res_lhcnm2_DUX4cont_v_DUXAcont %>% 
+   dplyr::filter(deg_DUX4cont_v_DUXAcont) %>% 
+   dplyr::mutate(gene_id = substr(gene_id,1,15))  %>% 
+   dplyr::select("gene_id","stat") %>% 
+  dplyr::arrange(stat)
+
+write.table(temp2_sorted_geneids,file="DUX4cont_v_DUXAcont_geneidsB.rnk",sep="\t",quote=F,col.names=F,row.names = F)
+
+```
+
+
+## are there are some downregulated genes? Can you make a Venn diagram with the downregulated genes?
+```{r}
+
+#up
+deg_DUX4_up<-subset(res_DUX4,res_DUX4$log2FoldChange > 1 & res_DUX4$padj < 0.05 &
+        (res_DUX4$DUX4cont > 2.5 | res_DUX4$DUX4dox > 2.5))$gene_id
+deg_DUXA_up<-subset(res_DUXA, res_DUXA$log2FoldChange > 1 & res_DUXA$padj < 0.05 &
+        (res_DUXA$DUXAcont > 2.5 | res_DUXA$DUXAdox > 2.5))$gene_id
+deg_DUXA_VP64_up <- subset(res_DUXA_VP64,res_DUXA_VP64$log2FoldChange > 1 & res_DUXA_VP64$padj < 0.05 &
+        (res_DUXA_VP64$DUXA_VP64cont > 2.5 | res_DUXA_VP64$DUXA_VP64dox > 2.5))$gene_id
+deg_DUXB_up <- subset(res_DUXB,res_DUXB$log2FoldChange > 1 & res_DUXB$padj < 0.05 &
+        (res_DUXB$DUXBcont > 2.5 | res_DUXB$DUXBdox > 2.5))$gene_id
+deg_sDUX_up <- subset(res_sDUX, res_sDUX$log2FoldChange > 1 & res_sDUX$padj < 0.05 &
+        (res_sDUX$sDUXcont > 2.5 | res_sDUX$sDUXdox > 2.5))$gene_id
+
+pdf(paste0("DUX_Paralog_UP_Venn",ts,".pdf"),width=5,height=4.5)
+grid.newpage()
+VennDiagram::draw.quintuple.venn(area1=length(deg_DUX4_up),
+                            area2=length(deg_DUXA_up),
+                            area3=length(deg_DUXA_VP64_up),
+                            area4=length(deg_DUXB_up),
+                            area5=length(deg_sDUX_up),
+                            
+                            n12=length(intersect(deg_DUX4_up,deg_DUXA_up)),
+                            n13=length(intersect(deg_DUX4_up,deg_DUXA_VP64_up)),
+                            n14=length(intersect(deg_DUX4_up,deg_DUXB_up)),
+                            n15=length(intersect(deg_DUX4_up,deg_sDUX_up)),
+                            
+                            n23=length(intersect(deg_DUXA_up,deg_DUXA_VP64_up)),
+                            n24=length(intersect(deg_DUXA_up,deg_DUXB_up)),
+                            n25=length(intersect(deg_DUXA_up,deg_sDUX_up)),
+                              
+                            n34=length(intersect(deg_DUXA_VP64_up,deg_DUXB_up)),
+                            n35=length(intersect(deg_DUXA_VP64_up,deg_sDUX_up)),
+                            n45=length(intersect(deg_DUXB_up,deg_sDUX_up)),
+                            
+                            n123=length(intersect(intersect(deg_DUX4_up,deg_DUXA_up),deg_DUXA_VP64_up)),
+                            n124=length(intersect(intersect(deg_DUX4_up,deg_DUXA_up),deg_DUXB_up)),
+                            n125=length(intersect(intersect(deg_DUX4_up,deg_DUXA_up),deg_sDUX_up)),
+                            n134=length(intersect(intersect(deg_DUX4_up,deg_DUXA_VP64_up),deg_DUXB_up)),
+                            n234=length(intersect(intersect(deg_DUXA_up,deg_DUXA_VP64_up),deg_DUXB_up)),
+                            n235=length(intersect(intersect(deg_DUXA_up,deg_DUXA_VP64_up),deg_sDUX_up)),
+                            n245=length(intersect(intersect(deg_DUXA_up,deg_DUXB_up),deg_sDUX_up)),
+                            n345=length(intersect(intersect(deg_DUXA_VP64_up,deg_DUXB_up),deg_sDUX_up)),
+                            n145=length(intersect(intersect(deg_DUX4_up,deg_DUXB_up),deg_sDUX_up)),
+                            n135=length(intersect(intersect(deg_DUX4_up,deg_DUXA_VP64_up),deg_sDUX_up)),
+                            
+                            n1234=length(intersect(intersect(intersect(deg_DUX4_up,deg_DUXA_up),deg_DUXA_VP64_up),deg_DUXB_up)),
+                            n1345=length(intersect(intersect(intersect(deg_DUX4_up,deg_DUXA_VP64_up),deg_DUXB_up),deg_sDUX_up)),
+                            n1245=length(intersect(intersect(intersect(deg_DUX4_up,deg_DUXA_up),deg_DUXB_up),deg_sDUX_up)),
+                            n1235=length(intersect(intersect(intersect(deg_DUX4_up,deg_DUXA_up),deg_DUXA_VP64_up),deg_sDUX_up)),
+                            n2345=length(intersect(intersect(intersect(deg_DUXA_up,deg_DUXA_VP64_up),deg_DUXB_up),deg_sDUX_up)),
+                            
+                          n12345=length(intersect(intersect(intersect(intersect(deg_DUX4_up,deg_DUXA_up),deg_DUXA_VP64_up),deg_DUXB_up),deg_sDUX_up)),
+                            fill=cbPalette[c(3,5,7,8,6)],
+                            category=c("DUX4_up",
+                                       "DUXA_up",
+                                       "DUXA-VP64_up",
+                                       "DUXB_up",
+                                       "sDUX_up"))
+dev.off()
+
+
+#dn
+deg_DUX4_dn<-subset(res_DUX4,res_DUX4$log2FoldChange < -1 & res_DUX4$padj < 0.05 &
+        (res_DUX4$DUX4cont > 2.5 | res_DUX4$DUX4dox > 2.5))$gene_id
+
+deg_DUXA_dn<-subset(res_DUXA, res_DUXA$log2FoldChange < -1 & res_DUXA$padj < 0.05 &
+        (res_DUXA$DUXAcont > 2.5 | res_DUXA$DUXAdox > 2.5))$gene_id
+
+deg_DUXA_VP64_dn <- subset(res_DUXA_VP64,res_DUXA_VP64$log2FoldChange < -1 & res_DUXA_VP64$padj < 0.05 &
+        (res_DUXA_VP64$DUXA_VP64cont > 2.5 | res_DUXA_VP64$DUXA_VP64dox > 2.5))$gene_id
+
+deg_DUXB_dn <- subset(res_DUXB,res_DUXB$log2FoldChange < -1 & res_DUXB$padj < 0.05 &
+        (res_DUXB$DUXBcont > 2.5 | res_DUXB$DUXBdox > 2.5))$gene_id
+
+deg_sDUX_dn <- subset(res_sDUX, res_sDUX$log2FoldChange < -1 & res_sDUX$padj < 0.05 &
+        (res_sDUX$sDUXcont > 2.5 | res_sDUX$sDUXdox > 2.5))$gene_id
+
+pdf(paste0("DUX_Paralog_Down_Venn",ts,".pdf"),width=5,height=4.5)
+grid.newpage()
+VennDiagram::draw.quintuple.venn(area1=length(deg_DUX4_dn),
+                            area2=length(deg_DUXA_dn),
+                            area3=length(deg_DUXA_VP64_dn),
+                            area4=length(deg_DUXB_dn),
+                            area5=length(deg_sDUX_dn),
+                            
+                            n12=length(intersect(deg_DUX4_dn,deg_DUXA_dn)),
+                            n13=length(intersect(deg_DUX4_dn,deg_DUXA_VP64_dn)),
+                            n14=length(intersect(deg_DUX4_dn,deg_DUXB_dn)),
+                            n15=length(intersect(deg_DUX4_dn,deg_sDUX_dn)),
+                            
+                            n23=length(intersect(deg_DUXA_dn,deg_DUXA_VP64_dn)),
+                            n24=length(intersect(deg_DUXA_dn,deg_DUXB_dn)),
+                            n25=length(intersect(deg_DUXA_dn,deg_sDUX_dn)),
+                              
+                            n34=length(intersect(deg_DUXA_VP64_dn,deg_DUXB_dn)),
+                            n35=length(intersect(deg_DUXA_VP64_dn,deg_sDUX_dn)),
+                            n45=length(intersect(deg_DUXB_dn,deg_sDUX_dn)),
+                            
+                            n123=length(intersect(intersect(deg_DUX4_dn,deg_DUXA_dn),deg_DUXA_VP64_dn)),
+                            n124=length(intersect(intersect(deg_DUX4_dn,deg_DUXA_dn),deg_DUXB_dn)),
+                            n125=length(intersect(intersect(deg_DUX4_dn,deg_DUXA_dn),deg_sDUX_dn)),
+                            n134=length(intersect(intersect(deg_DUX4_dn,deg_DUXA_VP64_dn),deg_DUXB_dn)),
+                            n234=length(intersect(intersect(deg_DUXA_dn,deg_DUXA_VP64_dn),deg_DUXB_dn)),
+                            n235=length(intersect(intersect(deg_DUXA_dn,deg_DUXA_VP64_dn),deg_sDUX_dn)),
+                            n245=length(intersect(intersect(deg_DUXA_dn,deg_DUXB_dn),deg_sDUX_dn)),
+                            n345=length(intersect(intersect(deg_DUXA_VP64_dn,deg_DUXB_dn),deg_sDUX_dn)),
+                            n145=length(intersect(intersect(deg_DUX4_dn,deg_DUXB_dn),deg_sDUX_dn)),
+                            n135=length(intersect(intersect(deg_DUX4_dn,deg_DUXA_VP64_dn),deg_sDUX_dn)),
+                            
+                            n1234=length(intersect(intersect(intersect(deg_DUX4_dn,deg_DUXA_dn),deg_DUXA_VP64_dn),deg_DUXB_dn)),
+                            n1345=length(intersect(intersect(intersect(deg_DUX4_dn,deg_DUXA_VP64_dn),deg_DUXB_dn),deg_sDUX_dn)),
+                            n1245=length(intersect(intersect(intersect(deg_DUX4_dn,deg_DUXA_dn),deg_DUXB_dn),deg_sDUX_dn)),
+                            n1235=length(intersect(intersect(intersect(deg_DUX4_dn,deg_DUXA_dn),deg_DUXA_VP64_dn),deg_sDUX_dn)),
+                            n2345=length(intersect(intersect(intersect(deg_DUXA_dn,deg_DUXA_VP64_dn),deg_DUXB_dn),deg_sDUX_dn)),
+                            
+                          n12345=length(intersect(intersect(intersect(intersect(deg_DUX4_dn,deg_DUXA_dn),deg_DUXA_VP64_dn),deg_DUXB_dn),deg_sDUX_dn)),
+                            fill=cbPalette[c(3,5,7,8,6)],
+                            category=c("DUX4_dn",
+                                       "DUXA_dn",
+                                       "DUXA-VP64_dn",
+                                       "DUXB_dn",
+                                       "sDUX_dn"))
+dev.off()
+
+```
+
+# DUX4, sDUX, DUXA-VP64 subset
+```{r}
+
+
+#pdf(paste0("Triple_Venn",ts,".pdf"),width=5,height=4.5)
+grid.newpage()
+VennDiagram::draw.triple.venn(area1=length(deg_DUX4_up),
+                                 area2=length(deg_DUXA_VP64_up),
+                                 area3=length(deg_sDUX_up),
+                            
+                            n12=length(intersect(deg_DUX4_up,deg_DUXA_VP64_up)),
+                            n13=length(intersect(deg_DUX4_up,deg_sDUX_up)),
+                            n23=length(intersect(deg_DUXA_VP64_up,deg_sDUX_up)),
+         
+                            n123=length(intersect(intersect(deg_DUX4_up,deg_DUXA_VP64_up),deg_sDUX_up)),
+                            fill=cbPalette[c(3,7,6)],
+                            category=c("DUX4_up",
+                                       "DUXA-VP64_up",
+                                       "sDUX_up"))
+#dev.off()
+
+  
+                              area1=length(deg_DUX4_up)
+                              area2=length(deg_DUXA_VP64_up)
+                              area3=length(deg_sDUX_up)
+                              
+                              n12=length(intersect(deg_DUX4_up,deg_DUXA_VP64_up))
+                              n13=length(intersect(deg_DUX4_up,deg_sDUX_up))
+                              n23=length(intersect(deg_DUXA_VP64_up,deg_sDUX_up))
+           
+                              n123=length(intersect(intersect(deg_DUX4_up,deg_DUXA_VP64_up),deg_sDUX_up))
+  
+                              
+  domains<-list()
+  length(domains[["D4AS"]]<-deg_DUX4_up[deg_DUX4_up %in% deg_DUXA_VP64_up & deg_DUX4_up %in% deg_sDUX_up]   ) 
+  length(domains[["D4A"]]<-deg_DUX4_up[deg_DUX4_up %in% deg_DUXA_VP64_up & !deg_DUX4_up %in% deg_sDUX_up & !deg_DUX4_up %in%  domains[["D4AS"]]] )
+  length(domains[["D4S"]]<-deg_DUX4_up[!deg_DUX4_up %in% deg_DUXA_VP64_up & deg_DUX4_up %in% deg_sDUX_up & !deg_DUX4_up %in%  domains[["D4AS"]]] )
+  length(domains[["D4"]]<-deg_DUX4_up[!deg_DUX4_up %in% deg_DUXA_VP64_up & !deg_DUX4_up %in% deg_sDUX_up & !deg_DUX4_up %in%  domains[["D4AS"]]] )
+  
+  length(domains[["DS"]]<-deg_sDUX_up[!deg_sDUX_up %in% deg_DUXA_VP64_up & !deg_sDUX_up %in% deg_DUX4_up] )
+  length(domains[["DAS"]]<-deg_sDUX_up[deg_sDUX_up %in% deg_DUXA_VP64_up & !deg_sDUX_up %in% deg_DUX4_up] )
+  length(domains[["DA"]]<-deg_DUXA_VP64_up[!deg_DUXA_VP64_up %in% deg_sDUX_up & !deg_DUXA_VP64_up %in% deg_DUX4_up] )
+  lengths(domains)
+                              
+  
+  (VennDiag <- euler(c("DUX4" = area1-n12-n13+n123,
+                      "DUXA_VP64" = area2-n12-n23+n123,
+                      "sDUX" = area3-n13-n23+n123,
+                      "DUX4&DUXA_VP64" = n12-n123,
+                      "DUX4&sDUX" = n13-n123,
+                      "DUXA_VP64&sDUX" = n23-n123,
+                      "DUX4&DUXA_VP64&sDUX" = n123)))
+  
+  svglite::svglite(paste0("DUX_UP_VENN_",ts,".svg"),width=9,height=8)                        
+  plot(VennDiag, quantities = TRUE, font=12, cex=10, alpha=0.5,
+       fill=cbPalette[c(5,7,6,4,2)],main="Up Regulated Genes")
+  dev.off()
+
+
+View(subset(res_sDUX,gene_id %in% intersect(deg_DUX4_up,deg_sDUX_up) & (gene_id %in% deg_DUXA_VP64_up)))
+
+
+#DOWN########
+                            area1=length(deg_DUX4_dn)
+                            area2=length(deg_DUXA_VP64_dn)
+                            area3=length(deg_sDUX_dn)
+                            
+                            n12=length(intersect(deg_DUX4_dn,deg_DUXA_VP64_dn))
+                            n13=length(intersect(deg_DUX4_dn,deg_sDUX_dn))
+                            n23=length(intersect(deg_DUXA_VP64_dn,deg_sDUX_dn))
+         
+                            n123=length(intersect(intersect(deg_DUX4_dn,deg_DUXA_VP64_dn),deg_sDUX_dn))
+
+
+(VennDiag <- euler(c("DUX4" = area1-n12-n13+n123,
+                    "DUXA_VP64" = area2-n12-n23+n123,
+                    "sDUX" = area3-n13-n23+n123,
+                    "DUX4&DUXA_VP64" = n12-n123,
+                    "DUX4&sDUX" = n13-n123,
+                    "DUXA_VP64&sDUX" = n23-n123,
+                    "DUX4&DUXA_VP64&sDUX" = n123)))
+
+plot(VennDiag, quantities = TRUE, font=12, cex=10, alpha=0.5,
+     fill=cbPalette[c(5,7,6,4,2)],main="Down Regulated Genes")
+
+
+
+```
+
+
+## can you send us the table with the 8 common genes?
+```{r}
+temp[temp$`Gene ID` %in% intersect(intersect(intersect(intersect(deg_DUX4,deg_DUXA),deg_DUXA_VP64),deg_DUXB),deg_sDUX),]
+```
+
+
+## One more thing looks that there is minimal overlap between DUXA and DUXAVP64.
+Can you compare directly so we can see what is going on over there?
+I was expecting that majority of DUXA target genes would be in DUXAVP64.
+
+```{r}
+as.data.frame(colData(dds_lhcnm2_DUXA_v_DUXA_VP64<-dds_lhcnm2[,str_detect(colData(dds_lhcnm2)$sample_name,"DUXA") &
+                                                                str_detect(colData(dds_lhcnm2)$cond,"dox") ]) )
+dds_lhcnm2_DUXA_v_DUXA_VP64<-estimateSizeFactors(dds_lhcnm2_DUXA_v_DUXA_VP64)
+dds_lhcnm2_DUXA_v_DUXA_VP64$paralog<-droplevels(dds_lhcnm2_DUXA_v_DUXA_VP64$paralog)
+design(dds_lhcnm2_DUXA_v_DUXA_VP64)<- ~paralog
+dds_lhcnm2_DUXA_v_DUXA_VP64<-DESeq(dds_lhcnm2_DUXA_v_DUXA_VP64)
+summary(res_lhcnm2_DUXA_v_DUXA_VP64<-results(dds_lhcnm2_DUXA_v_DUXA_VP64))
+
+res_lhcnm2_DUXA_v_DUXA_VP64<-as.data.frame(res_lhcnm2_DUXA_v_DUXA_VP64) %>% tibble::rownames_to_column(var="gene_id") %>% 
+  left_join(symbols) %>% 
+  left_join(f_mean_lhcnm2[,c("gene_id","DUXAdox","DUXA_VP64dox")])
+
+deg_DUXA_v_DUXA_VP64<-subset(res_lhcnm2_DUXA_v_DUXA_VP64,abs(log2FoldChange) > 1 & padj < 0.05 &
+        (DUXAdox > 2.5 | DUXA_VP64dox > 2.5))$gene_id
+
+table((res_lhcnm2_DUXA_v_DUXA_VP64$deg_DUXA_v_DUXA_VP64 <- res_lhcnm2_DUXA_v_DUXA_VP64$gene_id %in% deg_DUXA_v_DUXA_VP64),useNA="always")
+
+temp3<-res_lhcnm2_DUXA_v_DUXA_VP64 %>% 
+   dplyr::filter(deg_DUXA_v_DUXA_VP64) %>%
+  dplyr::select(gene_id,gene_name,log2FoldChange,padj,DUXAdox,DUXA_VP64dox,gene_type,chr) %>% 
+  dplyr::arrange(padj) %>% 
+  dplyr::rename("Gene ID" = gene_id, "Gene Symbol" = gene_name,
+                "Mean FPKM DUXA dox" = DUXAdox,
+                "Mean FPKM DUXA-VP64 dox" = DUXA_VP64dox) 
+
+
+write.csv(temp3,file=paste0("DUXA_v_DUXA_VP64_",ts,".csv"),quote=F,row.names = F) 
+```
+
+# GSEA
+```{r}
+download.file('https://ftp.ncbi.nlm.nih.gov/geo/series/GSE78nnn/GSE78158/suppl/GSE78158_Expression_summary.csv.gz',destfile = "GSE78158_Expression_summary.csv.gz")
+siho<-read.csv("GSE78158_Expression_summary.csv.gz")
+
+length(degs<-siho[as.numeric(siho$padj < 0.05 & abs(siho$log2FoldChange) > 1),]$Ensembl.Gene)
+
+lengths(dux_targets_choi<-list(up=siho[siho$padj < 0.05 & siho$log2FoldChange > 1,]$Ensembl.Gene, 
+                       down=siho[siho$padj < 0.05 & siho$log2FoldChange < -1,]$Ensembl.Gene))
+
+nm<-lapply(seq_along(dux_targets_choi), function(i) c(names(dux_targets_choi)[[i]],"NA", dux_targets_choi[[i]]))
+
+sink("dux_targets_choi.gmt")
+writeLines(unlist(lapply(nm, paste, collapse="\t")))
+sink()
+
+dim(temp<-as.data.frame(subset(res_7d_full_dmrt1,baseMean > 0 & padj < 0.05) ))
+temp$ensembl<-rownames(temp)
+temp<-temp[!is.na(temp$stat),]
+dim(temp)
+#write.table(temp[,c("ensembl","stat")],file="res_7d_full_dmrt1.rnk",sep="\t",quote=F,col.names=F,row.names = F)
+
+```
+
+# Determine differentially expressed genes in DUX4 relative to the DUXA control
+```{r}
+as.data.frame(colData(dds_lhcnm2_DUX4dox_v_DUXAcont<-dds_lhcnm2[,str_detect(colData(dds_lhcnm2)$sample_name,
+                                                                "LHCN-DUX4-46e|LHCN-DUX4-47e|LHCN-DUXA-1e|LHCN-DUXA-2e")  ]) )
+dds_lhcnm2_DUX4dox_v_DUXAcont<-estimateSizeFactors(dds_lhcnm2_DUX4dox_v_DUXAcont)
+dds_lhcnm2_DUX4dox_v_DUXAcont$paralog<-droplevels(dds_lhcnm2_DUX4dox_v_DUXAcont$paralog)
+design(dds_lhcnm2_DUX4dox_v_DUXAcont)<- ~paralog
+dds_lhcnm2_DUX4dox_v_DUXAcont<-DESeq(dds_lhcnm2_DUX4dox_v_DUXAcont)
+summary(res_lhcnm2_DUX4dox_v_DUXAcont<-results(dds_lhcnm2_DUX4dox_v_DUXAcont,contrast=c("paralog","DUX4","DUXA")))
+
+res_lhcnm2_DUX4dox_v_DUXAcont<-as.data.frame(res_lhcnm2_DUX4dox_v_DUXAcont) %>% tibble::rownames_to_column(var="gene_id") %>% 
+  left_join(symbols) %>% 
+  left_join(f_mean_lhcnm2[,c("gene_id","DUXAcont","DUX4dox")])
+
+deg_DUX4dox_v_DUXAcont<-subset(res_lhcnm2_DUX4dox_v_DUXAcont,abs(log2FoldChange) > 1 & padj < 0.05 &
+        (DUXAcont > 2.5 | DUX4dox > 2.5))$gene_id
+
+table((res_lhcnm2_DUX4dox_v_DUXAcont$deg_DUX4dox_v_DUXAcont <- res_lhcnm2_DUX4dox_v_DUXAcont$gene_id %in% deg_DUX4dox_v_DUXAcont),useNA="always")
+
+temp4<-res_lhcnm2_DUX4dox_v_DUXAcont %>% 
+   dplyr::filter(deg_DUX4dox_v_DUXAcont) %>% 
+  dplyr::select(gene_id,gene_name,log2FoldChange,padj,DUX4dox,DUXAcont,gene_type,chr) %>% 
+  dplyr::arrange(padj) %>% 
+  dplyr::rename("Gene ID" = gene_id, "Gene Symbol" = gene_name,
+                "Mean FPKM DUX4 Dox" = DUX4dox,
+                "Mean FPKM DUXA Control" = DUXAcont) 
+
+
+write.csv(temp4,file=paste0("DUX4dox_v_DUXAcont_",ts,".csv"),quote=F,row.names = F) 
+
+
+temp4_sorted_geneids<-res_lhcnm2_DUX4dox_v_DUXAcont %>% 
+   dplyr::filter(deg_DUX4dox_v_DUXAcont) %>% 
+   dplyr::mutate(gene_id = substr(gene_id,1,15))  %>% 
+   dplyr::select("gene_id","stat") %>% 
+  dplyr::arrange(stat)
+
+write.table(temp4_sorted_geneids,file="DUX4dox_v_DUXAcont_geneidsB.rnk",sep="\t",quote=F,col.names=F,row.names = F)
+
+#View(as.data.frame(res_lhcnm2_DUX4dox_v_DUXAcont))
+#View(as.data.frame(res_lhcnm2_DUX4cont_v_DUXAcont))
+```
+
+# Heatmap of "leaky" genes.
+```{r}
+temp5<-full_join(res_lhcnm2_DUX4dox_v_DUXAcont,res_lhcnm2_DUX4cont_v_DUXAcont,by=c("gene_id","gene_name","chr","gene_type"),suffix=c(".DUX4dox",".DUX4cont")) %>%
+  dplyr::filter(deg_DUX4cont_v_DUXAcont) %>% 
+   dplyr::mutate(gene_id = substr(gene_id,1,15))  %>% 
+  dplyr::filter(gene_id %in% dux_targets_choi[["up"]]) %>% 
+  dplyr::select(gene_name,log2FoldChange.DUX4dox,log2FoldChange.DUX4cont) %>% 
+  tibble::column_to_rownames("gene_name")
+
+plot(temp5$log2FoldChange.DUX4dox,temp5$log2FoldChange.DUX4cont)
+temp5[temp5$log2FoldChange.DUX4cont > temp5$log2FoldChange.DUX4dox,]
+
+col_fun = circlize::colorRamp2(c(min(temp5),0, max(temp5)), c("blue","white", "red"))
+Heatmap(temp5,col = col_fun)
+```
+
+# Calculate median distance between a DEG and nearest ATAC peak. Are common DEGs have more proximal ATAC peaks?
+## When you do this, could you also break down freq(gene has an induced ATAC peak within 10, 50, 250 kb) for each gene set?
+```{r}
+transcripts$gene_id<-substr(transcripts$gene_id,1,15)
+
+length(deg_DUX4)
+length(transcripts_DUX4<-transcripts[transcripts$gene_id %in% deg_DUX4])
+transcripts_DUX4<-keepStandardChromosomes(transcripts_DUX4,pruning.mode="coarse")
+transcripts_DUX4$w<-width(transcripts_DUX4)
+transcripts_DUX4<-transcripts_DUX4[with(transcripts_DUX4,order(-w))]
+length(transcripts_DUX4<-transcripts_DUX4[!duplicated(transcripts_DUX4$gene_id)])
+
+length(d2n_DUX4<-distanceToNearest(transcripts_DUX4,atac_DUX4))
+median(mcols(d2n_DUX4)$distance)
+
+
+length(deg_sDUX)
+length(transcripts_sDUX<-transcripts[transcripts$gene_id %in% deg_sDUX])
+transcripts_sDUX<-keepStandardChromosomes(transcripts_sDUX,pruning.mode="coarse")
+transcripts_sDUX$w<-width(transcripts_sDUX)
+transcripts_sDUX<-transcripts_sDUX[with(transcripts_sDUX,order(-w))]
+length(transcripts_sDUX<-transcripts_sDUX[!duplicated(transcripts_sDUX$gene_id)])
+
+length(d2n_sDUX<-distanceToNearest(transcripts_sDUX,atac_sDUX))
+median(mcols(d2n_sDUX)$distance)
+
+# DUXA_VP64
+length(deg_DUXA_VP64)
+length(transcripts_DUXA_VP64<-transcripts[transcripts$gene_id %in% deg_DUXA_VP64])
+transcripts_DUXA_VP64$w<-width(transcripts_DUXA_VP64)
+transcripts_DUXA_VP64<-transcripts_DUXA_VP64[with(transcripts_DUXA_VP64,order(-w))]
+length(transcripts_DUXA_VP64<-transcripts_DUXA_VP64[!duplicated(transcripts_DUXA_VP64$gene_id)])
+
+d2n_DUXA_VP64<-distanceToNearest(transcripts_DUXA_VP64,atac_DUXA_VP64)
+median(mcols(d2n_DUXA_VP64)$distance)
+
+
+partition <- function(d,cutoff=c(10e3,50e3,250e3)) {
+a<-sum(d <= cutoff[1])
+b<-sum(d > cutoff[1] & d <= cutoff[2])
+c<-sum(d > cutoff[2] & d <= cutoff[3])
+e<-sum(d > cutoff[3])
+x<-c(a,b,c,e)
+names(x)<-c(paste0("0-",cutoff[1]),paste0(cutoff[1]+1,"-",cutoff[2]),paste0(cutoff[2]+1,"-",cutoff[3]),paste0("> ",cutoff[3]))
+return(x)
+}
+
+
+
+
+
+df<-list()
+(df[["DUX4"]]<-partition(mcols(d2n_DUX4)$distance))
+(df[["DUXA_VP64"]]<-partition(mcols(d2n_DUXA_VP64)$distance))
+(df[["sDUX"]]<-partition(mcols(d2n_sDUX)$distance))
+
+dplyr::bind_rows(df,.id="sample") %>% 
+  tidyr::gather(class,number_of_sites,-sample) %>% 
+  mutate(number_of_sites=as.integer(number_of_sites)) %>%
+  mutate(sample=factor(sample,levels=c("DUX4","DUXA_VP64","sDUX"))) %>% 
+  group_by(sample) %>% 
+  mutate(total=sum(number_of_sites) ) %>% 
+  mutate(class=factor(class,levels=rev(c("0-10000","10001-50000","50001-250000","> 250000")))) %>% 
+ mutate(percentage=number_of_sites/total) %>% 
+  ungroup() %>% 
+  mutate(freq=number_of_sites/total) %>% 
+  ggplot(aes(x=sample,y=freq,fill=class)) +
+  geom_bar(stat="identity") + 
+  scale_fill_manual(values=c(cbPalette[c(2,4,6,3,5,8,1,7)],"black")) +
+#  geom_text(aes(label = number_of_sites, y=number_of_sites), position = "stack") +
+  ylab("Fraction") + xlab("") +
+  ggtitle("Distance between DEGs and ATAC-Peaks") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+# 091322    
+```{r}
+#ega_genes<-readxl::read_excel("kere_supp_1.xlsx",col_names = TRUE,skip=1)
+#length(ega_genes<-ega_genes[ega_genes$Module=="EGA",]$Gene)
+ega_genes$`Pre-8C gene`
+ega_genes<-readxl::read_excel("yu_wang_leutx_8c_sup_table.xlsx",col_names = TRUE,skip=1)
+ega_genes<-c(ega_genes$`Pre-8C gene`,ega_genes$`8C-specific genes`)
+ega_gene_ids<-symbols[symbols$gene_name %in% ega_genes,]$gene_id
+
+length(deg_DUX4_up_ega<-deg_DUX4_up[deg_DUX4_up %in% ega_gene_ids])
+head(symbols[symbols$gene_id %in% deg_DUX4_up_ega,])
+
+length(deg_DUXA_VP64_up_ega<-deg_DUXA_VP64_up[deg_DUXA_VP64_up %in% ega_gene_ids])
+head(symbols[symbols$gene_id %in% deg_DUXA_VP64_up_ega,])
+
+length(deg_sDUX_up_ega<-deg_sDUX_up[deg_sDUX_up %in% ega_gene_ids])
+head(symbols[symbols$gene_id %in% deg_sDUX_up_ega,])
+
+grid.newpage()
+VennDiagram::draw.triple.venn(area1=length(deg_DUX4_up_ega),
+                                 area2=length(deg_DUXA_VP64_up_ega),
+                                 area3=length(deg_sDUX_up_ega),
+                            
+                            n12=length(intersect(deg_DUX4_up_ega,deg_DUXA_VP64_up_ega)),
+                            n13=length(intersect(deg_DUX4_up_ega,deg_sDUX_up_ega)),
+                            n23=length(intersect(deg_DUXA_VP64_up_ega,deg_sDUX_up_ega)),
+         
+                            n123=length(intersect(intersect(deg_DUX4_up_ega,deg_DUXA_VP64_up_ega),deg_sDUX_up_ega)),
+                            fill=cbPalette[c(3,7,6)],
+                            category=c("DUX4_up_ega",
+                                       "DUXA-VP64_up_ega",
+                                       "sDUX_up_ega"))
+#dev.off()
+
+  
+                              area1=length(deg_DUX4_up_ega)
+                              area2=length(deg_DUXA_VP64_up_ega)
+                              area3=length(deg_sDUX_up_ega)
+                              
+                              n12=length(intersect(deg_DUX4_up_ega,deg_DUXA_VP64_up_ega))
+                              n13=length(intersect(deg_DUX4_up_ega,deg_sDUX_up_ega))
+                              n23=length(intersect(deg_DUXA_VP64_up_ega,deg_sDUX_up_ega))
+           
+                              n123=length(intersect(intersect(deg_DUX4_up_ega,deg_DUXA_VP64_up_ega),deg_sDUX_up_ega))
+  
+  
+  (VennDiag <- euler(c("DUX4" = area1-n12-n13+n123,
+                      "DUXA_VP64" = area2-n12-n23+n123,
+                      "sDUX" = area3-n13-n23+n123,
+                      "DUX4&DUXA_VP64" = n12-n123,
+                      "DUX4&sDUX" = n13-n123,
+                      "DUXA_VP64&sDUX" = n23-n123,
+                      "DUX4&DUXA_VP64&sDUX" = n123)))
+  
+  svglite::svglite(paste0("DUX_up_ega_VENN_EGA_",ts,".svg"),width=9,height=8)                        
+  plot(VennDiag, quantities = TRUE, font=12, cex=10, alpha=0.5,
+       fill=cbPalette[c(5,7,6,4,2)],main="Up Regulated pre-8C/8C Genes")
+  dev.off()
+
+
+length(temp<-ega_gene_ids[!ega_gene_ids %in% c(deg_DUX4,deg_DUXA,deg_DUXA_VP64,deg_DUXB,deg_DUXA)])
+
+
+temp2<-f_lhcnm2
+temp2<-temp2[rownames(temp2) %in% temp,]
+rownames(temp2)<-mcols(dds_lhcnm2)[match(rownames(temp2),rownames(dds_lhcnm2),1,15),"gene_name"]
+temp2<-log2(temp2+1)
+
+temp2<-temp2[apply(temp2,1,sum) > 0,]
+
+temp2<-t(scale(t(temp2),center=T))
+min(temp2)
+
+temp2<-temp2[,c("LHCN-DUX4-43e-cont1",
+"LHCN-DUX4-44e-cont2",
+"LHCN-DUX4-46e-dox12h2",
+"LHCN-DUX4-47e-dox12h1",   
+"LHCN-DUXA-1e-cont1",
+"LHCN-DUXA-2e-cont2",
+"LHCN-DUXA-4e-dox12h1",
+"LHCN-DUXA-5e-dox12h2",
+"LHCN-DUXAVP64-7e-cont1",
+"LHCN-DUXAVP64-8e-cont2",  
+"LHCN-DUXAVP64-10e-dox12h1",
+"LHCN-DUXAVP64-11e-dox12h2",
+"LHCN-DUXB-13e-cont1",
+"LHCN-DUXB-14e-cont2",
+"LHCN-DUXB-16e-dox12h1",
+"LHCN-DUXB-17e-dox12h2",   
+"LHCN-sDUX-25e-cont1",
+"LHCN-sDUX-26e-cont2",
+"LHCN-sDUX-28e-dox12h1",
+"LHCN-sDUX-29e-dox12h2")]
+
+temp2<-as.matrix(temp2)
+
+col_fun = circlize::colorRamp2(c(min(temp2),0, max(temp2)), c("blue","white", "red"))
+
+
+  Heatmap(temp2,cluster_columns = F,cluster_rows = T,show_row_names = F,col=col_fun,show_heatmap_legend = F) 
+
+
+
+
+```
+
+# global correlation log2fc
+```{r}
+
+head(res_DUX4)
+all.equal(res_DUX4$gene_id,res_DUXA$gene_id)
+all.equal(res_DUX4$gene_id,res_DUXA_VP64$gene_id)
+all.equal(res_DUX4$gene_id,res_DUXB$gene_id)
+all.equal(res_DUX4$gene_id,res_sDUX$gene_id)
+
+df<-data.frame(DUX4=res_DUX4$log2FoldChange,
+              DUXA=res_DUXA$log2FoldChange,
+              DUXA_VP64=res_DUXA_VP64$log2FoldChange,
+              DUXB=res_DUXB$log2FoldChange,
+              sDUX=res_sDUX$log2FoldChange)
+rownames(df)<-res_DUX4$gene_id
+
+df<-df[!(apply(df,1,function(x) any(is.na(x)))),]
+head(df)
+col_fun_cor=circlize::colorRamp2(c(0,1),colors=c("white","red"))
+Heatmap(cor(df),col=col_fun_cor,cluster_columns = F,cluster_rows=F)
+
+
+smoothScatter(df$sDUX,df$DUX4,nrpoints = 500,cex=2,xlim=c(-9,12),ylim=c(-9,12),main="DUX4")
+abline(lm(df$sDUX ~ df$DUX4), col="red2", lty=1, lwd=3)
+
+smoothScatter(df$sDUX,df$DUXA_VP64,nrpoints = 500,cex=2,xlim=c(-9,12),ylim=c(-9,12),main="DUXA_VP64")
+abline(lm(df$sDUX ~ df$DUXA_VP64), col="red2", lty=1, lwd=3)
+
+smoothScatter(df$sDUX,df$DUXB,nrpoints = 500,cex=2,xlim=c(-9,12),ylim=c(-9,12),main="DUXA_VP64")
+abline(lm(df$sDUX ~ df$DUXB), col="red2", lty=1, lwd=3)
+
+
+g1<-data.frame(x=df$sDUX,y=df$DUX4,d=densCols(df$sDUX,df$DUX4, colramp = colorRampPalette(rev(rainbow(10, end = 4/6))))) %>% 
+  ggplot(aes(x=x,y=y)) +
+    ggrastr::geom_point_rast(aes(x, y, col = d), size = 0.3) +
+    scale_color_identity() +
+  geom_smooth(method = "lm", se = TRUE,formula = y ~ x,level=0.95,color="black") +
+  xlim(c(-9,12)) + ylim(c(-9,12)) + coord_fixed() +
+    theme_bw()
+
+g2<-data.frame(x=df$sDUX,y=df$DUXA_VP64,d=densCols(df$sDUX,df$DUXA_VP64, colramp = colorRampPalette(rev(rainbow(10, end = 4/6))))) %>% 
+  ggplot(aes(x=x,y=y)) +
+     ggrastr::geom_point_rast(aes(x, y, col = d), size = 0.3) +
+    scale_color_identity() +
+  geom_smooth(method = "lm", se = TRUE,formula = y ~ x,level=0.95,color="black") +
+  xlim(c(-9,12)) + ylim(c(-9,12)) + coord_fixed() +
+    theme_bw()
+
+g3<-data.frame(x=df$sDUX,y=df$DUXA,d=densCols(df$sDUX,df$DUXA, colramp = colorRampPalette(rev(rainbow(10, end = 4/6))))) %>% 
+  ggplot(aes(x=x,y=y)) +
+      ggrastr::geom_point_rast(aes(x, y, col = d), size = 0.3) +
+    scale_color_identity() +
+  geom_smooth(method = "lm", se = TRUE,formula = y ~ x,level=0.95,color="black") +
+  xlim(c(-9,12)) + ylim(c(-9,12)) + coord_fixed() +
+    theme_bw()
+
+g4<-data.frame(x=df$sDUX,y=df$DUXB,d=densCols(df$sDUX,df$DUXB, colramp = colorRampPalette(rev(rainbow(10, end = 4/6))))) %>% 
+  ggplot(aes(x=x,y=y)) +
+       ggrastr::geom_point_rast(aes(x, y, col = d), size = 0.3) +
+    scale_color_identity() +
+  geom_smooth(method = "lm", se = TRUE,formula = y ~ x,level=0.95,color="black") +
+  xlim(c(-9,12)) + ylim(c(-9,12)) + coord_fixed() +
+    theme_bw()
+
+g5<-data.frame(x=df$DUX4,y=df$DUXA_VP64,d=densCols(df$DUX4,df$DUXA_VP64, colramp = colorRampPalette(rev(rainbow(10, end = 4/6))))) %>% 
+  ggplot(aes(x=x,y=y)) +
+        ggrastr::geom_point_rast(aes(x, y, col = d), size = 0.3) +
+    scale_color_identity() +
+  geom_smooth(method = "lm", se = TRUE,formula = y ~ x,level=0.95,color="black") +
+  xlim(c(-9,12)) + ylim(c(-9,12)) + coord_fixed() +
+    theme_bw()
+  
+
+   svglite::svglite(paste0("corr_plot_reg_",ts,".svg"),width=9,height=2)   
+  cowplot::plot_grid(g1,g2,g3,g4,g5,ncol=5)
+  dev.off()
+
+
+    g6<-df %>% 
+ggplot(aes(x=DUX4,y=DUXA)) + ggrastr::geom_point_rast() + 
+  geom_smooth(method = "lm", se = TRUE,level=0.95) + theme_bw() + xlim(c(-9,12)) + ylim(c(-9,12))
+g7<-df %>% 
+ggplot(aes(x=DUX4,y=DUXB)) + ggrastr::geom_point_rast() + 
+  geom_smooth(method = "lm", se = TRUE,level=0.95) + theme_bw() + xlim(c(-9,12)) + ylim(c(-9,12))
+g8<-df %>% 
+ggplot(aes(x=DUXA_VP64,y=DUXA)) + ggrastr::geom_point_rast() + 
+  geom_smooth(method = "lm", se = TRUE,level=0.95) + theme_bw() + xlim(c(-9,12)) + ylim(c(-9,12))
+g9<-df %>% 
+ggplot(aes(x=DUXA_VP64,y=DUXB)) + ggrastr::geom_point_rast() + 
+  geom_smooth(method = "lm", se = TRUE,level=0.95) + theme_bw() + xlim(c(-9,12)) + ylim(c(-9,12))
+g10<-df %>% 
+ggplot(aes(x=DUXA,y=DUXB)) + ggrastr::geom_point_rast() + 
+  geom_smooth(method = "lm", se = TRUE,level=0.95) + theme_bw() + xlim(c(-9,12)) + ylim(c(-9,12))
+
+```
+
+
+#simple Venns
+```{r}
+  
+  (VennDiag <- euler(c("DUX4" = 4963,
+                      "DUXA" = 18252,
+                      "DUX4&DUXA" = 1828)))
+  
+  svglite::svglite(paste0("fig6c_peaks_",ts,".svg"),width=9,height=8)                        
+  plot(VennDiag, quantities = TRUE, font=16, cex=10, alpha=0.5,
+       fill=cbPalette[c(4,2,5)],main="fig6c_peaks")
+  dev.off()
+  
+  
+   (VennDiag2 <- euler(c("DUX4" = 611,
+                      "DUXA" = 2623,
+                      "DUX4&DUXA" = 1378)))
+  
+  svglite::svglite(paste0("fig6c_genes_",ts,".svg"),width=9,height=8)  
+    plot(VennDiag2, quantities = TRUE, font=16, cex=10, alpha=0.5,
+       fill=cbPalette[c(4,2,5)],main="fig6c_genes")
+    dev.off()
+  
+  
+```
+

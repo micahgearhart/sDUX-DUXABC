@@ -1,0 +1,2199 @@
+---
+title: "DUX Paralog Analysis in LHCN-M2 Cells by RNA-seq"
+author: "Micah Gearhart"
+output: github_document
+date: "09-7-21"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+library("BSgenome.Hsapiens.UCSC.hg38")
+hg38<-BSgenome.Hsapiens.UCSC.hg38
+library("GenomicFeatures")
+library("BiocParallel")
+library("rtracklayer")
+library("Biostrings")
+library("ggplot2")
+library("ggseqlogo")
+library("stringr")
+library("dplyr")
+library("VennDiagram")
+library("ChIPpeakAnno")
+library("EnrichedHeatmap")
+library("circlize")
+
+library("org.Hs.eg.db")
+
+ts<-format(Sys.time(), "%a_%b_%d_%Y_%H%M")
+el_hg38<-import("../../R_RESOURCES/hg38_exclusionList.bed")
+
+narrowPeakToGRanges<-function(file,name="peak", ...) {
+  x <- read.table(file,stringsAsFactors=F, ...) 
+  gr <-GRanges(seqnames=x$V1, ranges = IRanges(start=x$V2+1, end=x$V3),
+               strand="*", score=x$V5, e=x$V7,summit=x$V2+x$V10)
+  gr<-keepStandardChromosomes(gr,pruning.mode = "coarse")
+  names(gr)<-paste0(name,"_",formatC(1:length(gr),width=5,format="d",flag="0"))
+  return(gr)
+}
+
+peak_center<-function(gr) { GRanges(seqnames=seqnames(gr),IRanges(start=start(gr)+width(gr)/2,width=1),strand=strand(gr)) }
+
+
+wls<- function(x) { paste0(seqnames(x),":",start(x),"-",end(x))}
+
+interset<-function(x,y) {
+  g<-reduce(c(x,y))
+  g<-g[g %over% x & g %over% y]
+  return(g)
+}
+
+
+merge_replicates<-function(x,y,name="peak_") {
+gr_cat <- sort(c(x,y))
+
+length(gr<-reduce(gr_cat,with.revmap=T))
+gr_revmap<-gr$revmap
+temp<-relist(mcols(gr_cat)[unlist(gr_revmap), ], gr_revmap)
+gr$score<-unlist(lapply(temp,function(a) round(mean(a$score),1)))
+gr$summit<-unlist(lapply(temp,function(a) round(mean(a$summit),0)))
+length(gr<-gr[gr %over% x & gr %over% y]) #require overlap in both
+length(gr<-gr[!gr %over% el_hg38])
+names(gr)<-paste0(name,formatC(1:length(gr),width=5,format="d",flag="0"))
+return(gr)
+
+}
+```
+
+# Load Peak list for ATAC-seq data
+
+# ATAC-Venn
+```{r}
+(fls<-list.files("atac_data",pattern = "narrowPeak",full.names = T) %>% str_subset("_vs_",negate=T))
+
+fls_dux4<-str_which(fls,"DUX4")
+#length(atac_DUX4<-interset(narrowPeakToGRanges(fls[fls_dux4[1]]),narrowPeakToGRanges(fls[fls_dux4[2]])))
+#names(atac_DUX4)<-paste0("atac_DUX4_",formatC(1:length(atac_DUX4),width=5,format="d",flag="0"))
+length(atac_DUX4<-merge_replicates(narrowPeakToGRanges(fls[fls_dux4[1]]),narrowPeakToGRanges(fls[fls_dux4[2]]),name="atac_DUX4_"))
+
+fls_duxA<-str_which(fls,"DUXA_")
+#length(atac_DUXA<-interset(narrowPeakToGRanges(fls[fls_duxA[1]]),narrowPeakToGRanges(fls[fls_duxA[2]])))
+#names(atac_DUXA)<-paste0("atac_DUXA_",formatC(1:length(atac_DUXA),width=5,format="d",flag="0"))
+length(atac_DUXA<-merge_replicates(narrowPeakToGRanges(fls[fls_duxA[1]]),narrowPeakToGRanges(fls[fls_duxA[2]]),name="atac_DUXA_"))
+
+fls_duxAvp64<-str_which(fls,"DuxAVP64")
+#length(atac_DUXA_VP64<-interset(narrowPeakToGRanges(fls[fls_duxAvp64[1]]),narrowPeakToGRanges(fls[fls_duxAvp64[2]])))
+#names(atac_DUXA_VP64)<-paste0("atac_DUXA_VP64_",formatC(1:length(atac_DUXA_VP64),width=5,format="d",flag="0"))
+length(atac_DUXA_VP64<-merge_replicates(narrowPeakToGRanges(fls[fls_duxAvp64[1]]),narrowPeakToGRanges(fls[fls_duxAvp64[2]]),name="atac_DUXA_VP64_"))
+
+fls_sdux<-str_which(fls,"sDux")
+#length(atac_sDUX<-interset(narrowPeakToGRanges(fls[fls_sdux[1]]),narrowPeakToGRanges(fls[fls_sdux[2]])))
+#names(atac_sDUX)<-paste0("atac_sDUX_",formatC(1:length(atac_sDUX),width=5,format="d",flag="0"))
+length(atac_sDUX<-merge_replicates(narrowPeakToGRanges(fls[fls_sdux[1]]),narrowPeakToGRanges(fls[fls_sdux[2]]),name="atac_sDUX_"))
+
+length(composite<-reduce(c(atac_DUX4,atac_DUXA,atac_DUXA_VP64,atac_sDUX)))
+save(composite,atac_DUX4,atac_DUXA,atac_DUXA_VP64,atac_sDUX,file="atac_peaklists.rdata")
+
+```
+
+
+```{r}
+pdf(paste0("DUX_Paralog_ATAC_Venn_",ts,".pdf"),width=5,height=4.5)
+grid.newpage()
+VennDiagram::draw.quad.venn(area1=length(atac_DUX4),
+                            area2=length(atac_DUXA),
+                            area3=length(atac_DUXA_VP64),
+                            area4=length(atac_sDUX),
+                            
+                            n12=length(interset(atac_DUX4,atac_DUXA)),
+                            n13=length(interset(atac_DUX4,atac_DUXA_VP64)),
+                            n14=length(interset(atac_DUX4,atac_sDUX)),
+                            
+                            n23=length(interset(atac_DUXA,atac_DUXA_VP64)),
+                            n24=length(interset(atac_DUXA,atac_sDUX)),
+                              
+                            n34=length(interset(atac_DUXA_VP64,atac_sDUX)),
+                            
+                            n123=length(interset(interset(atac_DUX4,atac_DUXA),atac_DUXA_VP64)),
+                            n124=length(interset(interset(atac_DUX4,atac_DUXA),atac_sDUX)),
+        
+                            n134=length(interset(interset(atac_DUX4,atac_DUXA_VP64),atac_sDUX)),
+                            n234=length(interset(interset(atac_DUXA,atac_DUXA_VP64),atac_sDUX)),
+
+                            
+                            n1234=length(interset(interset(interset(atac_DUX4,atac_DUXA),atac_DUXA_VP64),atac_sDUX)),
+                            
+                            fill=cbPalette[c(3,5,7,8)],
+                            category=c("DUX4",
+                                       "DUXA",
+                                       "DUXA-VP64",
+                                       "sDUX"))
+dev.off()
+
+```
+
+#identify sites in genome
+```{r}
+
+
+findsites <- function (pattern,seq) {
+  top_sites<-GRanges()
+  bot_sites<-GRanges()
+  temp<-matchPattern(DNAString(pattern),Hsapiens[[seq]],fixed="subject",max.mismatch = 0)
+ # temp2<-matchPattern(reverseComplement(DNAString(pattern)),Hsapiens[[seq]],fixed="subject")
+#  print(paste0(seq," Plus strand:  ",length(temp)))
+#  print(paste0(seq," Minus strand:  ",length(temp2)))
+  if (length(temp) > 0) { top_sites<-GRanges(seqnames=seq,ranges=IRanges(start=start(temp),end=end(temp)),strand="+") }
+ # if (length(temp2) > 0) { bot_sites<-GRanges(seqnames=seq,ranges=IRanges(start=start(temp2),end=end(temp2)),strand="-") }
+  return(suppressWarnings(c(top_sites)))
+        }
+
+pattern<-"TRATNNNATYA"
+chry<-findsites(pattern,"chrY")
+length(chry)
+
+chroms<- as.list(paste0("chr",c(1:22,"X","Y")))
+names(chroms)<-chroms
+
+system.time(tratnnnatya<-bplapply(chroms, function(x) findsites(pattern,x)))
+lengths(tratnnnatya)
+length(tratnnnatya<-unlist(GRangesList(tratnnnatya)))
+#export(unlist(GRangesList(temp)),"TRATNNNATYAmm2.bed")
+
+
+```
+
+
+No mismatches: 461,382
+1 mismatch: 8,542,149
+2 mismathes: 62,476,139
+
+
+3) Send a list of ATAC regions that are shared between DUX4 and DUXA and shared between DUX4 and DUXA-VP64.
+
+```{r}
+#make a list of deg transcripts in DUX4 or DUXA, pick widest transcript per gene_id
+length(deg_DUX4_DUXA_DUXAVP64<-unique(c(deg_DUX4,deg_DUXA,deg_DUXA_VP64)))
+length(deg_4A_common<-intersect(deg_DUX4,unique(c(deg_DUXA,deg_DUXA_VP64))))
+
+length(temp_transcripts<-subset(transcripts,gene_id %in% deg_DUX4_DUXA_DUXAVP64))
+temp_transcripts$size<-width(temp_transcripts)
+temp_transcripts[grep("KIF1B",temp_transcripts$symbol)]
+temp_transcripts<-temp_transcripts[with(temp_transcripts,order(-size))]
+length(temp_transcripts_dedup<-temp_transcripts[!duplicated(temp_transcripts$gene_id)])
+temp_transcripts_dedup[grep("KIF1B",temp_transcripts_dedup$symbol)]
+strand(temp_transcripts_dedup)<-"*"
+
+#DUXA
+length(shared_DUX4_DUXA<-interset(atac_DUX4,atac_DUXA))
+head(names(shared_DUX4_DUXA)<-paste0("sd4da_",formatC(1:length(shared_DUX4_DUXA),width=5,format="d",flag="0")))
+length(shared_DUX4_DUXA_anno<-annotate_peaks(shared_DUX4_DUXA, tx = temp_transcripts_dedup, cutoff = Inf,collapse=F))
+length(unique(shared_DUX4_DUXA_anno$gene_id))
+
+length(shared_DUX4_DUXA_anno<-shared_DUX4_DUXA_anno[!duplicated(shared_DUX4_DUXA_anno$peak)])
+shared_DUX4_DUXA_anno$wls<-wls(shared_DUX4_DUXA_anno)
+table(shared_DUX4_DUXA_anno$num_tratnnnatya<-countOverlaps(shared_DUX4_DUXA_anno,tratnnnatya))
+table(shared_DUX4_DUXA_anno$common<-shared_DUX4_DUXA_anno$gene_id %in% deg_4A_common)
+head(mcols(shared_DUX4_DUXA_anno))
+mcols(shared_DUX4_DUXA_anno)<-mcols(shared_DUX4_DUXA_anno)[,c("peak","wls","symbol","gene_id","num_tratnnnatya","common","insideFeature","distancetoFeature")]
+colnames(mcols(shared_DUX4_DUXA_anno))<-c("common peak","coordinates","nearest deg","nearest deg gene_id","Number of TRATNNNATYA Motifs","Common Deg","Relative Location","Distance to Deg")
+head(shared_DUX4_DUXA_anno)
+
+write.csv(as.data.frame(mcols(shared_DUX4_DUXA_anno)),file="shared_DUX4_DUXA_ATAC_Peaks.csv",quote=F,row.names=F)
+
+#DUXA_VP64
+length(shared_DUX4_DUXA_VP64<-interset(atac_DUX4,atac_DUXA_VP64))
+
+head(names(shared_DUX4_DUXA_VP64)<-paste0("sd4davp64_",formatC(1:length(shared_DUX4_DUXA_VP64),width=5,format="d",flag="0")))
+length(shared_DUX4_DUXA_VP64_anno<-annotate_peaks(shared_DUX4_DUXA_VP64, tx = temp_transcripts_dedup, cutoff = Inf,collapse=F))
+length(shared_DUX4_DUXA_VP64_anno<-shared_DUX4_DUXA_VP64_anno[!duplicated(shared_DUX4_DUXA_VP64_anno$peak)])
+
+length(unique(shared_DUX4_DUXA_VP64_anno$gene_id))
+
+shared_DUX4_DUXA_VP64_anno$wls<-wls(shared_DUX4_DUXA_VP64_anno)
+table(shared_DUX4_DUXA_VP64_anno$num_tratnnnatya<-countOverlaps(shared_DUX4_DUXA_VP64_anno,tratnnnatya))
+table(shared_DUX4_DUXA_VP64_anno$common<-shared_DUX4_DUXA_VP64_anno$gene_id %in% deg_4A_common)
+
+head(mcols(sshared_DUX4_DUXA_VP64_anno))
+mcols(shared_DUX4_DUXA_VP64_anno)<-mcols(shared_DUX4_DUXA_VP64_anno)[,c("peak","wls","symbol","gene_id","num_tratnnnatya","common","insideFeature","distancetoFeature")]
+colnames(mcols(shared_DUX4_DUXA_VP64_anno))<-c("common peak","coordinates","nearest deg","nearest deg gene_id","Number of TRATNNNATYA Motifs","Common Deg","Relative Location","Distance to Deg")
+
+head(shared_DUX4_DUXA_VP64_anno)
+
+write.csv(as.data.frame(mcols(shared_DUX4_DUXA_VP64_anno)),file="shared_DUX4_DUXA-VP64_ATAC_Peaks.csv",quote=F,row.names=F)
+
+
+
+
+```
+
+#Import Motifs from Jaspar
+JASPAR DUXES:
+MA0884.1 DUXA TRATNNNATCA
+MA0468.1 DUX4 TAATNNNATCA
+MA0681.1 Paired  TAATNNNATTA
+
+```{r}
+#download.file("http://jaspar.genereg.net/api/v1/matrix/MA0681.1.pfm",destfile = "MA0681.1.pfm")
+paired_jaspar_pfm<-as.matrix(read.table("MA0681.1.pfm",skip=1))
+paired_jaspar_pfm <- apply (paired_jaspar_pfm, c (1, 2), function (x) {(as.integer(x))})
+rownames(paired_jaspar_pfm)<-c("A","C","G","T")
+colnames(paired_jaspar_pfm)<-NULL
+paired_jaspar_motif<-new("pfm",mat=t(t(paired_jaspar_pfm[1:4,])*1/colSums(paired_jaspar_pfm[1:4,])), name="Paired HD MA0681.1.pfm")
+
+#download.file("http://jaspar.genereg.net/api/v1/matrix/MA0468.1.pfm",destfile = "MA0468.1.pfm")
+dux4_jaspar_pfm<-as.matrix(read.table("MA0468.1.pfm",skip=1))
+dux4_jaspar_pfm <- apply (dux4_jaspar_pfm, c (1, 2), function (x) {(as.integer(x))})
+rownames(dux4_jaspar_pfm)<-c("A","C","G","T")
+colnames(dux4_jaspar_pfm)<-NULL
+dux4_jaspar_motif<-new("pfm",mat=t(t(dux4_jaspar_pfm[1:4,])*1/colSums(dux4_jaspar_pfm[1:4,])), name="DUX4 MA0468.1.pfm")
+
+#download.file("http://jaspar.genereg.net/api/v1/matrix/MA0884.1.pfm",destfile = "MA0884.1.pfm")
+duxa_jaspar_pfm<-as.matrix(read.table("MA0884.1.pfm",skip=1))
+duxa_jaspar_pfm <- apply (duxa_jaspar_pfm, c (1, 2), function (x) {(as.integer(x))})
+rownames(duxa_jaspar_pfm)<-c("A","C","G","T")
+colnames(duxa_jaspar_pfm)<-NULL
+duxa_jaspar_motif<-new("pfm",mat=t(t(duxa_jaspar_pfm[1:4,])*1/colSums(duxa_jaspar_pfm[1:4,])), name="DUXA MA0884.1.pfm")
+
+plotMotifLogoStack(DNAmotifAlignment(list(dux4_jaspar_motif,duxa_jaspar_motif,paired_jaspar_motif),revcomp=c(F,F,F)))
+```
+
+
+
+# Count numbers of motifs per peak for each list (FIGURE F 091622?)
+```{r}
+
+table(atac_DUX4$num_tratnnnatya<-countOverlaps(atac_DUX4,tratnnnatya))
+table(atac_DUXA$num_tratnnnatya<-countOverlaps(atac_DUXA,tratnnnatya))
+table(atac_DUXA_VP64$num_tratnnnatya<-countOverlaps(atac_DUXA_VP64,tratnnnatya))
+table(atac_sDUX$num_tratnnnatya<-countOverlaps(atac_sDUX,tratnnnatya))
+
+sitenums<-list()
+sitenums[["DUX4"]]<-table(atac_DUX4$num_tratnnnatya)
+sitenums[["sDUX"]]<-table(atac_sDUX$num_tratnnnatya)
+sitenums[["DUXA"]]<-table(atac_DUXA$num_tratnnnatya)
+sitenums[["DUXA_VP64"]]<-table(atac_DUXA_VP64$num_tratnnnatya)
+
+x<-t(as.matrix(round(bind_rows(sitenums),3)))
+colnames(x)<-c("DUX4","sDUX","DUXA","DUXA_VP64")
+
+x %>% as.data.frame() %>% 
+  tibble::rownames_to_column("number_of_sites") %>% 
+  tidyr::gather(paralog,count,-number_of_sites) %>% 
+  dplyr::filter(!is.na(count)) %>% 
+   mutate(count=as.integer(count)) %>%
+  mutate(paralog=factor(paralog,levels=c("DUX4","DUXA","DUXA_VP64","sDUX"))) %>% 
+  group_by(paralog) %>% 
+  mutate(total=sum(count )) %>% 
+  ungroup() %>% 
+  mutate(freq=count/total) %>% 
+  mutate(number_of_sites=factor(number_of_sites,levels=rev(c("0","1","2","3","4","5",
+                                                         "6","7","8","9","13","14")))) %>% 
+ggplot(aes(x=paralog,y=freq,fill=number_of_sites)) +
+  geom_bar(stat="identity") + 
+  scale_fill_manual(values=c("lightgray","gray","darkgray",cbPalette)) +
+  geom_text(aes(label = count, color=freq), position = "stack") +
+  xlab("") + ggtitle("Number of TRATNNNATYA Motifs within Dox-Induced Accessibile Regions") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+```
+
+#Export sequences for meme
+```{r}
+
+extract_dna<-function(gr,sites=0) {
+ # temp<-gr[gr$num_tratnnnatya==sites]
+  qs1<-quantile(width(gr),c(0, 0.25, 0.5, 0.75, 0.98))
+  temp<-gr[width(gr) > qs1[2] & width(gr)<qs1[4]]
+ # gr<-temp
+
+  #temp.center<-GRanges(seqnames(temp),IRanges(start=temp$summit,width=1),score=temp$score)+100
+ # names(temp.center)<-names(temp)
+  qs<-quantile(temp$score, c(0, 0.25, 0.5, 0.75, 0.98))
+#return(gr[gr$score > qs[4] & gr$score < qs[5]])
+  temp<-temp[temp$score > qs[2] & temp$score < qs[5]]
+  temp<-temp[with(mcols(temp),order(-score))]
+  n<-ifelse(length(temp) < 500, length(temp),500)
+  #temp<-sample(temp,n)
+  temp<-head(temp,n)
+  temp.dna<-getSeq(BSgenome.Hsapiens.UCSC.hg38,temp)
+  return(temp.dna)
+}
+
+
+length(atac_DUX4_full.dna<-extract_dna(atac_DUX4,sites=0))
+export(atac_DUX4_full.dna,"atac_DUX4_tpq500.fasta")
+lengths(vmatchPattern(DNAString("TRATNNNATYA"),atac_DUX4_full.dna,fixed="subject",max.mismatch = 0))
+
+length(atac_sDUX_full.dna<-extract_dna(atac_sDUX,sites=0))
+export(atac_sDUX_full.dna,"atac_sDUX_tqp500.fasta")
+lengths(vmatchPattern(DNAString("TRATNNNATYA"),atac_sDUX_full.dna,fixed="subject",max.mismatch = 0))
+
+length(atac_DUXA_full.dna<-extract_dna(atac_DUXA,sites=0))
+export(atac_DUXA_full.dna,"atac_DUXA_top500.fasta")
+lengths(vmatchPattern(DNAString("TRATNNNATYA"),atac_DUXA_full.dna,fixed="subject",max.mismatch = 0))
+
+length(atac_DUXA_VP64_full.dna<-extract_dna(atac_DUXA_VP64,sites=0))
+export(atac_DUXA_VP64_full.dna,"atac_DUXA_VP64_tpq500.fasta")
+lengths(vmatchPattern(DNAString("TRATNNNATYA"),atac_DUXA_VP64_full.dna,fixed="subject",max.mismatch = 0))
+
+
+
+
+  extract_dna<-function(gr,sites=0) {
+  temp<-gr[gr$num_tratnnnatya==sites]
+  temp<-temp[with(mcols(temp),order(-score))]
+  temp.center<-GRanges(seqnames(temp),IRanges(start=temp$summit,width=1),score=temp$score)+100
+  names(temp.center)<-names(temp)
+  temp.center<-head(temp.center,500)
+  temp.center.dna<-getSeq(BSgenome.Hsapiens.UCSC.hg38,temp.center)
+  return(temp.center.dna)
+}
+
+atac_DUX4_0n.dna<-extract_dna(atac_DUX4,sites=0)
+export(atac_DUX4_0n.dna,"atac_DUX4_0n.fasta")
+lengths(vmatchPattern(DNAString("TRATNNNATYA"),atac_DUX4_0n.dna,fixed="subject",max.mismatch = 0))
+
+atac_sDUX_0n.dna<-extract_dna(atac_sDUX,sites=0)
+export(atac_sDUX_0n.dna,"atac_sDUX_0n.fasta")
+lengths(vmatchPattern(DNAString("TRATNNNATYA"),atac_sDUX_0n.dna,fixed="subject",max.mismatch = 0))
+
+atac_DUXA_0n.dna<-extract_dna(atac_DUXA,sites=0)
+export(atac_DUXA_0n.dna,"atac_DUXA_0n.fasta")
+lengths(vmatchPattern(DNAString("TRATNNNATYA"),atac_DUXA_0n.dna,fixed="subject",max.mismatch = 0))
+
+atac_DUXA_VP64_0n.dna<-extract_dna(atac_DUXA_VP64,sites=0)
+export(atac_DUXA_VP64_0n.dna,"atac_DUXA_VP64_0n.fasta")
+lengths(vmatchPattern(DNAString("TRATNNNATYA"),atac_DUXA_VP64_0n.dna,fixed="subject",max.mismatch = 0))
+
+extract_dna<-function(gr,sites=0) {
+  temp<-gr[gr$num_tratnnnatya!=sites]
+  temp<-temp[with(mcols(temp),order(-score))]
+  temp.center<-GRanges(seqnames(temp),IRanges(start=temp$summit,width=1),score=temp$score)+100
+  names(temp.center)<-names(temp)
+  temp.center<-head(temp.center,500)
+  temp.center.dna<-getSeq(BSgenome.Hsapiens.UCSC.hg38,temp.center)
+  return(temp.center.dna)
+}
+
+atac_DUX4_n.dna<-extract_dna(atac_DUX4,sites=0)
+export(atac_DUX4_n.dna,"atac_DUX4_n.fasta")
+lengths(vmatchPattern(DNAString("TRATNNNATYA"),atac_DUX4_n.dna,fixed="subject",max.mismatch = 0))  #must not be in center
+
+
+atac_sDUX_n.dna<-extract_dna(atac_sDUX,sites=0)
+export(atac_sDUX_n.dna,"atac_sDUX_n.fasta")
+
+atac_DUXA_n.dna<-extract_dna(atac_DUXA,sites=0)
+export(atac_DUXA_n.dna,"atac_DUXA_n.fasta")
+
+atac_DUXA_VP64_n.dna<-extract_dna(atac_DUXA_VP64,sites=0)
+export(atac_DUXA_VP64_n.dna,"atac_DUXA_VP64_n.fasta")
+
+atac_DUX4["atac_DUX4_15434"]
+atac_DUX4["atac_DUX4_08683"]
+```
+
+# Import Meme
+```{r}
+(fls2<-list.files("meme5",pattern = ".txt$",full.names = TRUE))
+
+plot_motifs<-function(file) {
+temp.meme<-TFBSTools:::parseMEMEOutput412(file)
+fasta_file<-paste0(tools::file_path_sans_ext(file),".fasta")
+x<-lengths(temp.meme_dna<-relist(getSeq(readDNAStringSet(fasta_file),unlist(temp.meme$motifList)),temp.meme$motifList))
+names(temp.meme_dna)<-paste0("Motif ",1:length(temp.meme$motifList),", p-value: ",temp.meme$motifEvalues," ( ",x," sites )")
+ggplot() + geom_logo(lapply(temp.meme_dna,as.character),seq_type='dna') + theme_logo() +
+  facet_wrap(~seq_group, ncol=1, scales='free_x') + ggtitle(basename(tools::file_path_sans_ext(file)))
+}
+
+plot_motifs(fls2[1])
+plot_motifs(fls2[2])
+plot_motifs(fls2[3])
+```
+
+
+```{r}
+
+#DUX4
+dux4.meme<-TFBSTools:::parseMEMEOutput412(fls2[1])
+dux4.fasta<-paste0(tools::file_path_sans_ext(fls2[1]),".fasta")
+x<-lengths(dux4.meme_dna<-relist(getSeq(readDNAStringSet(dux4.fasta),unlist(dux4.meme$motifList)),dux4.meme$motifList))
+dux4.pfm<-consensusMatrix(reverseComplement(dux4.meme_dna[[2]]))
+dux4.motif<-new("pfm",mat=t(t(dux4.pfm[1:4,])*1/colSums(dux4.pfm[1:4,])), name=paste0("DUX4 Motif, p= ",dux4.meme$motifEvalues[2]))
+
+svglite::svglite(paste0("DUX4_motif_",ts,".svg"),width=8,height=8)
+plotMotifLogoStack(DNAmotifAlignment(list(dux4_jaspar_motif,dux4.motif),revcomp=c(T,F)))
+dev.off()
+
+#DUXA
+duxAvp64.meme<-TFBSTools:::parseMEMEOutput412(fls2[2])
+duxAvp64.fasta<-paste0(tools::file_path_sans_ext(fls2[2]),".fasta")
+x<-lengths(duxAvp64.meme_dna<-relist(getSeq(readDNAStringSet(duxAvp64.fasta),unlist(duxAvp64.meme$motifList)),duxAvp64.meme$motifList))
+duxAvp64.pfm<-consensusMatrix(reverseComplement(duxAvp64.meme_dna[[1]]))
+duxAvp64.motif<-new("pfm",mat=t(t(duxAvp64.pfm[1:4,])*1/colSums(duxAvp64.pfm[1:4,])), name=paste0("DUXA-VP64 Motif, p= ",duxAvp64.meme$motifEvalues[1]))
+
+svglite::svglite(paste0("DUXA_motif_",ts,".svg"),width=8,height=8)
+plotMotifLogoStack(DNAmotifAlignment(list(duxa_jaspar_motif,duxAvp64.motif),revcomp=c(F,F)))
+dev.off()
+
+#SDUX
+sdux.meme<-TFBSTools:::parseMEMEOutput412(fls2[3])
+sdux.fasta<-paste0(tools::file_path_sans_ext(fls2[3]),".fasta")
+x<-lengths(sdux.meme_dna<-relist(getSeq(readDNAStringSet(sdux.fasta),unlist(sdux.meme$motifList)),sdux.meme$motifList))
+sdux.pfm<-consensusMatrix(sdux.meme_dna[[1]])
+sdux.motif<-new("pfm",mat=t(t(sdux.pfm[1:4,])*1/colSums(sdux.pfm[1:4,])), name=paste0("sDUX Motif, p= ",sdux.meme$motifEvalues[1]))
+plotMotifLogoStack(DNAmotifAlignment(list(sdux.motif,dux4.motif,duxAvp64.motif),revcomp=c(F,F,F)))
+
+svglite::svglite(paste0("sDUX_",ts,".svg"),width=8,height=8)
+plotMotifLogoStack(DNAmotifAlignment(list(sdux.motif,dux4.motif),revcomp=c(F,F)))
+dev.off()
+
+
+#genome wide scan
+
+find_sites<-function(i,pfm=dux4.pfm,score="95%") {
+temp1<-suppressWarnings(matchPWM(PWM(pfm),hg38[[i]],min.score=score, with.score=TRUE))
+temp2<-suppressWarnings(matchPWM(PWM(reverseComplement(pfm)),hg38[[i]],min.score=score, with.score=TRUE))
+return(sort(c(GRanges(seqnames=i,temp1@ranges,strand="+",score=round(temp1@elementMetadata$score,3)),
+              GRanges(seqnames=i,temp2@ranges,strand="-",score=round(temp2@elementMetadata$score,3)))))
+}
+
+system.time(dux4.sites<-bplapply(paste0("chr",c(1:22,"X","Y")), function(x) find_sites(x,pfm=dux4.pfm[1:4,],score="95%")))
+sapply(dux4.sites,length)
+dux4.sites<-sort(unlist(GRangesList(dux4.sites)))
+length(reduce(dux4.sites))
+table(atac_DUX4 %over% dux4.sites)
+table(atac_sDUX %over% dux4.sites)
+table(atac_DUXA_VP64 %over% dux4.sites)
+
+system.time(sdux.sites<-bplapply(paste0("chr",c(1:22,"X","Y")), function(x) find_sites(x,pfm=sdux.pfm[1:4,],score="95%")))
+sapply(sdux.sites,length)
+sdux.sites<-sort(unlist(GRangesList(sdux.sites)))
+length(reduce(sdux.sites))
+table(atac_DUX4 %over% sdux.sites)
+table(atac_sDUX %over% sdux.sites)
+table(atac_DUXA_VP64 %over% sdux.sites)
+
+system.time(duxAvp64.sites<-bplapply(paste0("chr",c(1:22,"X","Y")), function(x) find_sites(x,pfm=duxAvp64.pfm[1:4,],score="95%")))
+sapply(duxAvp64.sites,length)
+duxAvp64.sites<-sort(unlist(GRangesList(duxAvp64.sites)))
+length(reduce(duxAvp64.sites))
+table(atac_DUX4 %over% duxAvp64.sites)
+table(atac_sDUX %over% duxAvp64.sites)
+table(atac_DUXA_VP64 %over% duxAvp64.sites)
+
+mega<-sort(c(dux4.sites,sdux.sites,duxAvp64.sites))
+mega$wls<-wls(mega)
+length(mega)
+mega<-mega[!duplicated(mega$wls)]
+save(mega,file="mega.rdata")
+length(mega)
+
+
+```
+
+
+```{r}
+(fls<-list.files("atac_data",pattern = "narrowPeak",full.names = T) %>% str_subset("_vs_|C98|delta",negate=T))
+names(fls)<-fls %>% gsub("atac_data/","",.) %>% gsub(".macsbroad_peaks.narrowPeak","",.)
+
+#lengths(peaks<-lapply(fls,narrowPeakToGRanges))
+
+peaks<-list(atac_sDUX,atac_DUX4,atac_DUXA_VP64)
+head(peaks)
+seqlengths(Hsapiens)
+peaks[["genome"]]<-GRanges(names(seqlengths(Hsapiens)),IRanges(start=1,end=seqlengths(Hsapiens)),strand="*")
+names(peaks)<-c("sDUX","DUX4","DUXA-VP64","genome")
+
+
+enumerate_class<-function(gr) {
+  sites<-mega[mega %over% gr]
+  sites.dna<-getSeq(BSgenome.Hsapiens.UCSC.hg38,sites)
+  table(factor(case_when(
+  subseq(sites.dna,2,2) == "A" & subseq(sites.dna,10,10) == "C"  ~ "DUX4-like",
+  subseq(sites.dna,2,2) == "A" & subseq(sites.dna,10,10) == "T"  ~ "P3-like",
+  subseq(sites.dna,2,2) == "A" & subseq(sites.dna,10,10) == "A"  ~ "RR",
+  subseq(sites.dna,2,2) == "A" & subseq(sites.dna,10,10) == "G"  ~ "RR",
+  subseq(sites.dna,2,2) == "G" & subseq(sites.dna,10,10) == "C"  ~ "mDux-like",
+  subseq(sites.dna,2,2) == "G" & subseq(sites.dna,10,10) == "T"  ~ "DUX4-like",
+  subseq(sites.dna,2,2) == "G" & subseq(sites.dna,10,10) == "G"  ~ "RR",
+  subseq(sites.dna,2,2) == "G" & subseq(sites.dna,10,10) == "A"  ~ "RR",
+  subseq(sites.dna,2,2) == "C" & subseq(sites.dna,10,10) == "C"  ~ "YY",
+  subseq(sites.dna,2,2) == "C" & subseq(sites.dna,10,10) == "T"  ~ "YY",
+  subseq(sites.dna,2,2) == "C" & subseq(sites.dna,10,10) == "G"  ~ "mDux-like",
+  subseq(sites.dna,2,2) == "C" & subseq(sites.dna,10,10) == "A"  ~ "DUX4-like",
+  subseq(sites.dna,2,2) == "T" & subseq(sites.dna,10,10) == "C"  ~ "YY",
+  subseq(sites.dna,2,2) == "T" & subseq(sites.dna,10,10) == "T"  ~ "YY",
+  subseq(sites.dna,2,2) == "T" & subseq(sites.dna,10,10) == "G"  ~ "DUX4-like",
+  subseq(sites.dna,2,2) == "T" & subseq(sites.dna,10,10) == "A"  ~ "P3-like",
+  TRUE ~ "huh?"
+               )))
+}
+
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+x<-lapply(peaks,enumerate_class)
+#x[["C98_A"]]["DUX4-like"]<-0
+unlist(x)
+
+svglite::svglite(paste0("motif_class_",ts,".svg"),width=4,height=6)
+bind_rows(x,.id = "sample") %>% 
+  tidyr::gather(class,number_of_sites,-sample) %>% 
+  mutate(number_of_sites=as.integer(number_of_sites)) %>%
+ # mutate(sample=factor(sample,levels=c("genome","DUX4_A","DUX4_B","DUXA_A","DUXA_B",
+  #                                    "DuxAVP64_A","DuxAVP64_B","sDux_A","sDux_B"))) %>% 
+  mutate(sample=factor(sample,levels=c("genome","sDUX","DUX4","DUXA-VP64"))) %>% 
+  mutate(class=factor(class,levels=rev(c("DUX4-like","mDux-like","P3-like")))) %>% 
+  group_by(sample) %>% 
+  mutate(total=sum(number_of_sites) ) %>% 
+ # mutate(percentage=number_of_sites/total) %>% 
+  ungroup() %>% 
+  mutate(freq=number_of_sites/total) %>% 
+  ggplot(aes(x=sample,y=freq,fill=class)) +
+  geom_bar(stat="identity") + 
+  scale_fill_manual(values=cbPalette[c(8,7,4)]) +
+  geom_text(aes(label = number_of_sites, y=freq), position = "stack") +
+  xlab("") + ggtitle("Frequency of DUX Motif Classes Within Dox-Induced Accessibile Regions") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+dev.off()
+
+
+
+# of motifs?
+
+table(atac_DUX4$num_mega<-countOverlaps(atac_DUX4,mega))
+table(atac_DUXA$num_mega<-countOverlaps(atac_DUXA,mega))
+table(atac_DUXA_VP64$num_mega<-countOverlaps(atac_DUXA_VP64,mega))
+table(atac_sDUX$num_mega<-countOverlaps(atac_sDUX,mega))
+
+sitenums<-list()
+sitenums[["DUX4"]]<-table(atac_DUX4$num_mega)
+sitenums[["sDUX"]]<-table(atac_sDUX$num_mega)
+sitenums[["DUXA"]]<-table(atac_DUXA$num_mega)
+sitenums[["DUXA_VP64"]]<-table(atac_DUXA_VP64$num_mega)
+
+x<-t(as.matrix(round(bind_rows(sitenums),3)))
+colnames(x)<-c("DUX4","sDUX","DUXA","DUXA_VP64")
+
+
+svglite::svglite(paste0("motif_numbers_",ts,".svg"),width=4,height=6)
+x %>% as.data.frame() %>% 
+  tibble::rownames_to_column("number_of_sites") %>% 
+  tidyr::gather(paralog,count,-number_of_sites) %>% 
+  dplyr::filter(!is.na(count)) %>% 
+   mutate(count=as.integer(count)) %>%
+  group_by(paralog) %>% 
+  mutate(total=sum(count )) %>% 
+  ungroup() %>% 
+  mutate(freq=count/total) %>% 
+  dplyr::filter(paralog != "DUXA") %>% 
+  mutate(paralog=factor(paralog,levels=c("sDUX","DUX4","DUXA_VP64"))) %>% 
+  mutate(number_of_sites=as.integer(number_of_sites)) %>% 
+  mutate(number_of_sites= factor(case_when(
+    number_of_sites == 0 ~ "0",
+    number_of_sites == 1 ~ "1",
+    number_of_sites == 2 ~ "2",
+    number_of_sites == 3 ~ "3",
+    number_of_sites == 4 | number_of_sites == 5 ~ "4-5",
+    number_of_sites >= 6 & number_of_sites <= 8 ~ "6-8",
+    number_of_sites >= 9 & number_of_sites <= 11  ~ "9-11",
+    number_of_sites >= 12 & number_of_sites <= 15  ~ "12-15",
+    number_of_sites >= 16 & number_of_sites <= 20  ~ "16-20",
+    number_of_sites >= 21 & number_of_sites <= 30  ~ "21-30",
+    number_of_sites >= 31 & number_of_sites <= 40 ~ "31-40"
+  ),levels=rev(c("0","1","2","3","4-5","6-8","9-11","12-15","16-20","21-30","31-40")))) %>% 
+  #mutate(number_of_sites=factor(number_of_sites,levels=rev(c("0","1","2","3","4","5",
+ #                                                        "6","7","8","9","10","11","12","13","14","16","17","18","19","20","22","27","30","31")))) %>% 
+ggplot(aes(x=paralog,y=freq,fill=number_of_sites)) +
+  geom_bar(stat="identity") + 
+  scale_fill_manual(values=c("lightgray","gray","darkgray",cbPalette)) +
+  geom_text(aes(label = count, color=freq), position = "stack") +
+  xlab("") + ggtitle("Number of Mega Motifs within Dox-Induced Accessibile Regions") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+dev.off()
+
+
+
+```
+
+```{r}
+table(atac_DUX4$num_mega<-countOverlaps(atac_DUX4,mega))
+table(atac_DUXA$num_mega<-countOverlaps(atac_DUXA,mega))
+table(atac_DUXA_VP64$num_mega<-countOverlaps(atac_DUXA_VP64,mega))
+table(atac_sDUX$num_mega<-countOverlaps(atac_sDUX,mega))
+
+sitenums<-list()
+sitenums[["DUX4"]]<-table(atac_DUX4$num_mega)
+sitenums[["sDUX"]]<-table(atac_sDUX$num_mega)
+sitenums[["DUXA"]]<-table(atac_DUXA$num_mega)
+sitenums[["DUXA_VP64"]]<-table(atac_DUXA_VP64$num_mega)
+
+z<-t(as.matrix(round(bind_rows(sitenums),3)))
+colnames(z)<-c("DUX4","sDUX","DUXA","DUXA_VP64")
+
+z %>% as.data.frame() %>% 
+  tibble::rownames_to_column("number_of_sites") %>% 
+  tidyr::gather(paralog,count,-number_of_sites) %>% 
+  dplyr::filter(!is.na(count)) %>% 
+   mutate(count=as.integer(count)) %>%
+  mutate(paralog=factor(paralog,levels=c("DUX4","DUXA","DUXA_VP64","sDUX"))) %>% 
+  group_by(paralog) %>% 
+  mutate(total=sum(count )) %>% 
+  ungroup() %>% 
+  mutate(freq=count/total) %>% 
+  mutate(number_of_sites=factor(number_of_sites,levels=rev(as.character(sort(as.numeric(rownames(z))))))) %>%
+ggplot(aes(x=paralog,y=freq,fill=number_of_sites)) +
+  geom_bar(stat="identity") + 
+  scale_fill_manual(values=c("black","lightgray","gray","darkgray",
+                             "lightgray","gray","darkgray",
+                             "lightgray","gray","darkgray",
+                             cbPalette)) +
+  geom_text(aes(label = count, y=freq),position="stack") +
+  xlab("") + ggtitle("Number of DUX Motifs within Dox-Induced Accessibile Regions") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+```
+
+
+```{r}
+(mean_width<-mean(width(atac_DUX4)))
+length(x<-unlist(tileGenome(seqlengths(BSgenome.Hsapiens.UCSC.hg38),tilewidth=mean_width)))
+
+atac_DUX4$num_dux4<-countOverlaps(atac_DUX4,dux4.sites)
+x$num_dux4<-countOverlaps(x,dux4.sites)
+
+(a<-table(atac_DUX4$num_dux4 > 0))
+(b<-table(x$num_dux4 > 0))
+phyper(a[2],b[2],b[1],(a[1]+a[2]),lower.tail=F,log=T)
+
+#sDUX
+(mean_width<-mean(width(atac_sDUX)))
+length(x<-unlist(tileGenome(seqlengths(BSgenome.Hsapiens.UCSC.hg38),tilewidth=mean_width)))
+
+atac_sDUX$num_sdux<-countOverlaps(atac_sDUX,sdux.sites)
+x$num_sdux<-countOverlaps(x,sdux.sites)
+
+(a<-table(atac_sDUX$num_sdux > 0))
+(b<-table(x$num_sdux > 0))
+phyper(a[2],b[2],b[1],(a[1]+a[2]),lower.tail=F,log=F)
+
+
+#,sdux.sites,duxAvp64.sites)
+
+
+```
+
+# Calculate Enrichment under peaks
+```{r}
+dux4.mot<-universalmotif::convert_motifs(dux4.motif)
+dux4.mot["name"]<-"DUX4"
+dux4.mot["bkg"]<- c(A = 0.29480, C = 0.20520, G = 0.20520, T = 0.29480)
+universalmotif::write_meme(dux4.mot,file="dux4.meme",overwrite = TRUE)
+
+sdux.mot<-universalmotif::convert_motifs(sdux.motif)
+sdux.mot["name"]<-"sDUX"
+sdux.mot["bkg"]<- c(A = 0.29480, C = 0.20520, G = 0.20520, T = 0.29480)
+universalmotif::write_meme(sdux.mot,file="sdux.meme",overwrite = TRUE)
+
+duxAvp64.mot<-universalmotif::convert_motifs(duxAvp64.motif)
+duxAvp64.mot["name"]<-"DUXA-VP64"
+duxAvp64.mot["bkg"]<- c(A = 0.29480, C = 0.20520, G = 0.20520, T = 0.29480)
+universalmotif::write_meme(duxAvp64.mot,file="duxAvp64.meme",overwrite = TRUE)
+
+universalmotif::view_motifs(c(dux4.mot,sdux.mot,duxAvp64.mot), show.positions.once = TRUE, names.pos = "right")
+
+
+be<-enrich_motifs(dux4.mot, sequences=atac_DUX4.dna, bkg.sequences=random_DUX4.dna, 
+              threshold = motif_score(dux4.mot)[2]*0.95, threshold.type="logodds.abs", RC = TRUE,log.p=T)
+
+enrich_motifs(c(dux4.mot,sdux.mot,duxAvp64.mot), sequences=atac_sDUX.dna, bkg.sequences=random_sDUX.dna, threshold = 0.001, threshold.type="logodds", RC = TRUE)
+enrich_motifs(c(dux4.mot,sdux.mot,duxAvp64.mot), sequences=atac_DUXA.dna, bkg.sequences=random_DUXA.dna, threshold = 0.001, threshold.type="logodds", RC = TRUE)
+enrich_motifs(duxAvp64.mot, sequences=atac_DUXA_VP64.dna, bkg.sequences=random_DUXA_VP64.dna, threshold = 0.001, threshold.type="logodds", RC = TRUE)
+
+motif_score(dux4.mot)[2]*0.95
+
+ss<-scan_sequences(dux4.mot,atac_sDUX.dna,threshold=motif_score(dux4.mot)[2]*0.95,threshold.type="logodds.abs")
+
+length(unique(ss$sequence))
+
+```
+
+#############################################################
+Look at DUX peaks in absence of DUX
+```{r}
+length(a<-narrowPeakToGRanges("atac_data/DUX4_vs_DUXA_nodox_peaks.narrowPeak"))
+length(b<-narrowPeakToGRanges("atac_data/DUX4_vs_sDUX_nodox_peaks.narrowPeak"))
+length(c<-narrowPeakToGRanges("atac_data/DUX4_vs_DUXB_nodox_peaks.narrowPeak"))
+length(d<-narrowPeakToGRanges("atac_data/DUX4_vs_DUXAVP64_nodox_peaks.narrowPeak"))
+
+length(DUX4_nodox_vs_DUXB_nodox_anno<-annotate_peaks(c, tx = temp_transcripts_dedup, cutoff = Inf,collapse=F))
+length(unique(DUX4_nodox_vs_DUXB_nodox_anno$gene_id))
+
+length(DUX4_nodox_vs_DUXB_nodox_anno<-DUX4_nodox_vs_DUXB_nodox_anno[!duplicated(DUX4_nodox_vs_DUXB_nodox_anno$peak)])
+DUX4_nodox_vs_DUXB_nodox_anno$wls<-wls(DUX4_nodox_vs_DUXB_nodox_anno)
+table(DUX4_nodox_vs_DUXB_nodox_anno$num_tratnnnatya<-countOverlaps(DUX4_nodox_vs_DUXB_nodox_anno,tratnnnatya))
+#table(DUX4_nodox_vs_DUXB_nodox_anno$common<-DUX4_nodox_vs_DUXB_nodox_anno$gene_id %in% deg_4A_common)
+head(mcols(DUX4_nodox_vs_DUXB_nodox_anno))
+mcols(DUX4_nodox_vs_DUXB_nodox_anno)<-mcols(DUX4_nodox_vs_DUXB_nodox_anno)[,c("peak","score","wls","symbol","gene_id","num_tratnnnatya","insideFeature","distancetoFeature")]
+DUX4_nodox_vs_DUXB_nodox_anno<-DUX4_nodox_vs_DUXB_nodox_anno[with(DUX4_nodox_vs_DUXB_nodox_anno,order(-score))]
+colnames(mcols(DUX4_nodox_vs_DUXB_nodox_anno))<-c("Peak Number","Peak Score","coordinates","nearest deg","nearest deg gene_id","Number of TRATNNNATYA Motifs","Relative Location","Distance to Deg")
+
+head(DUX4_nodox_vs_DUXB_nodox_anno)
+
+write.csv(as.data.frame(mcols(DUX4_nodox_vs_DUXB_nodox_anno)),file="DUX4_nodox_vs_DUXB_nodox.csv",quote=F,row.names=F)
+
+
+
+```
+
+
+```{r}
+fls<-list.files("for_MEME",pattern = ".bed$",full.names = TRUE)
+names(fls)<-fls
+
+extract_dna<-function(file) {
+gr<-import(file)
+#gr<-gr[width(gr) > 50]
+#summary(width(proximal_TSS_cluster_02))
+#head(proximal_TSS_cluster_02)
+#seqlevelsStyle(proximal_TSS_cluster_02)
+#gr.dna<-getSeq(BSgenome.Hsapiens.UCSC.hg38,gr)
+#names(gr.dna)<-paste0("atac_region_",formatC(1:length(gr.dna),width=5,format="d",flag="0"))
+#tail(proximal_TSS_cluster_02.dna)
+#export(gr.dna,paste0(tools::file_path_sans_ext(file),".fasta"))
+paste0("# of regions:  ",length(gr),";   Min size:  ",min(width(gr)),";   Max size:  ",max(width(gr)))
+}
+
+lapply(fls,extract_dna)
+
+```
+
+
+```{r}
+(fls2<-list.files("for_MEME",pattern = ".txt$",full.names = TRUE))
+
+plot_motifs<-function(file) {
+temp.meme<-TFBSTools:::parseMEMEOutput412(file)
+fasta_file<-paste0(tools::file_path_sans_ext(file),".fasta")
+x<-lengths(temp.meme_dna<-relist(getSeq(readDNAStringSet(fasta_file),unlist(temp.meme$motifList)),temp.meme$motifList))
+names(temp.meme_dna)<-paste0("Motif ",1:length(temp.meme$motifList),", p-value: ",temp.meme$motifEvalues," ( ",x," sites )")
+ggplot() + geom_logo(lapply(temp.meme_dna,as.character),seq_type='dna') + theme_logo() +
+  facet_wrap(~seq_group, ncol=1, scales='free_x') + ggtitle(basename(tools::file_path_sans_ext(file)))
+}
+
+pdf("DUX_MEME_motifs.pdf",height = 11, width = 8.5)
+plot_motifs(fls2[1])
+plot_motifs(fls2[2])
+plot_motifs(fls2[3])
+plot_motifs(fls2[4])
+plot_motifs(fls2[5])
+plot_motifs(fls2[6])
+plot_motifs("distal_TSS_cluster_02_Dux4_only_1000_sample.txt")
+plot_motifs(fls2[8])
+plot_motifs(fls2[9])
+dev.off()
+
+plot_motifs(fls2[7])
+```
+
+```{r}
+x<-100*t(as.matrix(read.table("tratnnnatya_iupac.meme",skip=12)))
+rownames(x)<-c("A","C","G","T")
+mode(x)<-"integer"
+plotMotifLogo(t(t(x[1:4,])*1/colSums(x[1:4,])))
+tratnnnatya.pwm<-PWM(x,prior.params = c(A=0.29480, C=0.20520, G=0.20520, T=0.29480))
+maxScore(tratnnnatya.pwm)
+
+
+abc<-DNAString(c("ACGTTAATCGAATTAACGTACGTTGATCGAATCAACGT"))
+y<-matchPWM(tratnnnatya.pwm,abc,with.score=TRUE,min.score="95%")
+PWMscoreStartingAt(tratnnnatya.pwm, abc, starting.at=1)
+
+find_sites<-function(i,pwm=tratnnnatya.pwm,score="95%") {
+temp1<-suppressWarnings(matchPWM(pwm,hg38[[i]],min.score=score, with.score=TRUE))
+temp2<-suppressWarnings(matchPWM(reverseComplement(pwm),hg38[[i]],min.score=score, with.score=TRUE))
+return(sort(c(GRanges(seqnames=i,temp1@ranges,strand="+",score=round(temp1@elementMetadata$score,3)),
+              GRanges(seqnames=i,temp2@ranges,strand="-",score=round(temp2@elementMetadata$score,3)))))
+}
+
+system.time(tratnnnatya.sites<-bplapply(paste0("chr",c(1:22,"X","Y")), function(x) find_sites(x)))
+sapply(tratnnnatya.sites,length)
+tratnnnatya.sites<-sort(unlist(GRangesList(tratnnnatya.sites)))
+table(atac_DUX4 %over% tratnnnatya.sites)
+table(random_DUX4 %over% tratnnnatya.sites)
+
+
+x.pfm<-new("pfm",mat=t(t(x[1:4,])*1/colSums(x[1:4,])), name="TRATNNNATYAA",background=c(0.29480,0.20520,0.20520,0.29480))
+plotMotifLogoStack(DNAmotifAlignment(list(x.pfm,x.pfm),revcomp=c(F,F)))
+
+ggplot() + geom_logo(x.pfm,seq_type='dna') + theme_logo() +
+```
+
+
+```{r}
+ 
+biggr<-import("for_MEME/distal_TSS_cluster_02_Dux4_only.bed")
+length(biggr)
+length(biggr<-biggr[width(biggr) > 95])
+summary(width(biggr))
+biggr_sample<-sample(biggr,1000)
+length(biggr_sample)
+#summary(width(proximal_TSS_cluster_02))
+#head(proximal_TSS_cluster_02)
+#seqlevelsStyle(proximal_TSS_cluster_02)
+biggr_sample.dna<-getSeq(BSgenome.Hsapiens.UCSC.hg38,biggr_sample)
+names(biggr_sample.dna)<-paste0("atac_region_",formatC(1:length(biggr_sample.dna),width=5,format="d",flag="0"))
+#tail(proximal_TSS_cluster_02.dna)
+export(biggr_sample.dna,"distal_TSS_cluster_02_Dux4_only_1000_sample.fasta")
+paste0("# of regions:  ",length(biggr_sample),";   Min size:  ",min(width(biggr_sample)),";   Max size:  ",max(width(biggr_sample.dna)))
+
+```
+
+
+
+```{r}
+(fls<-list.files("atac_data",pattern = "narrowPeak",full.names = T))
+
+length(c98<-interset(narrowPeakToGRanges(fls[1]),narrowPeakToGRanges(fls[2])))
+length(deltaC<-interset(narrowPeakToGRanges(fls[3]),narrowPeakToGRanges(fls[4])))
+length(dux4<-interset(narrowPeakToGRanges(fls[5]),narrowPeakToGRanges(fls[6])))
+length(duxA<-interset(narrowPeakToGRanges(fls[7]),narrowPeakToGRanges(fls[8])))
+length(duxA_VP64<-interset(narrowPeakToGRanges(fls[9]),narrowPeakToGRanges(fls[10])))
+length(sDux<-interset(narrowPeakToGRanges(fls[11]),narrowPeakToGRanges(fls[12])))
+
+peaks_combined<-list(c98,deltaC,dux4,duxA,duxA_VP64,sDux)
+names(peaks_combined)<-c("DUX4-c98","DUX4ΔC","DUX4","DUXA","DUXA-VP64","sDux")
+
+pdf("Motifs_under_ATAC_peaks_two_Mismathes.pdf",width=8.5,height=11)
+length(sDux_sites<-temp[temp %over% sDux])
+names(sDux_sites)<-paste0("sdux_",1:length(sDux_sites))
+sDux_sites.dna<-getSeq(BSgenome.Hsapiens.UCSC.hg38,sDux_sites)
+head(sDux_sites.dna)
+table(case_when(
+  Biostrings::subseq(sDux_sites.dna,2,2) == "A" & Biostrings::subseq(sDux_sites.dna,10,10) == "C"  ~ "DUX4-like",
+  Biostrings::subseq(sDux_sites.dna,2,2) == "G" & Biostrings::subseq(sDux_sites.dna,10,10) == "C"  ~ "mDux-like",
+  Biostrings::subseq(sDux_sites.dna,2,2) == "A" & Biostrings::subseq(sDux_sites.dna,10,10) == "T"  ~ "P3-like",
+  Biostrings::subseq(sDux_sites.dna,2,2) == "G" & Biostrings::subseq(sDux_sites.dna,10,10) == "T"  ~ "DUX4-like",
+  TRUE ~ "huh?"
+               ))
+
+ggplot() + geom_logo(consensusMatrix(sDux_sites.dna)[1:4,],seq_type='dna') + theme_logo() + ggtitle(paste0 (length(sDux_sites)," motifs under sDux ATAC regions"))
+
+length(dux4_sites<-temp[temp %over% dux4])
+names(dux4_sites)<-paste0("dux4_",1:length(dux4_sites))
+dux4_sites.dna<-getSeq(BSgenome.Hsapiens.UCSC.hg38,dux4_sites)
+
+table(case_when(
+  Biostrings::subseq(dux4_sites.dna,2,2) == "A" & Biostrings::subseq(dux4_sites.dna,10,10) == "C"  ~ "DUX4-like",
+  Biostrings::subseq(dux4_sites.dna,2,2) == "G" & Biostrings::subseq(dux4_sites.dna,10,10) == "C"  ~ "mDux-like",
+  Biostrings::subseq(dux4_sites.dna,2,2) == "A" & Biostrings::subseq(dux4_sites.dna,10,10) == "T"  ~ "P3-like",
+  Biostrings::subseq(dux4_sites.dna,2,2) == "G" & Biostrings::subseq(dux4_sites.dna,10,10) == "T"  ~ "DUX4-like",
+  TRUE ~ "huh?"
+               ))
+ggplot() + geom_logo(consensusMatrix(dux4_sites.dna)[1:4,],seq_type='dna') + theme_logo() + ggtitle(paste0 (length(dux4_sites)," motifs under DUX4 ATAC regions"))
+
+length(deltaC_sites<-temp[temp %over% deltaC])
+names(deltaC_sites)<-paste0("deltaC_",1:length(deltaC_sites))
+deltaC_sites.dna<-getSeq(BSgenome.Hsapiens.UCSC.hg38,deltaC_sites)
+table(case_when(
+  Biostrings::subseq(dux4_sites.dna,2,2) == "A" & Biostrings::subseq(dux4_sites.dna,10,10) == "C"  ~ "DUX4-like",
+  Biostrings::subseq(dux4_sites.dna,2,2) == "G" & Biostrings::subseq(dux4_sites.dna,10,10) == "C"  ~ "mDux-like",
+  Biostrings::subseq(dux4_sites.dna,2,2) == "A" & Biostrings::subseq(dux4_sites.dna,10,10) == "T"  ~ "P3-like",
+  Biostrings::subseq(dux4_sites.dna,2,2) == "G" & Biostrings::subseq(dux4_sites.dna,10,10) == "T"  ~ "DUX4-like",
+  TRUE ~ "huh?"
+               ))
+ggplot() + geom_logo(consensusMatrix(deltaC_sites.dna)[1:4,],seq_type='dna') + theme_logo() + ggtitle(paste0 (length(deltaC_sites)," motifs under deltaC ATAC regions"))
+
+length(duxA_VP64_sites<-temp[temp %over% duxA_VP64])
+names(duxA_VP64_sites)<-paste0("DuxA_VP64_",1:length(duxA_VP64_sites))
+duxA_VP64_sites.dna<-getSeq(BSgenome.Hsapiens.UCSC.hg38,duxA_VP64_sites+10)
+ggplot() + geom_logo(consensusMatrix(duxA_VP64_sites.dna)[1:4,],seq_type='dna') + theme_logo() + ggtitle(paste0 (length(duxA_VP64_sites)," motifs under DUXA_VP64 ATAC regions"))
+
+length(duxA_sites<-temp[temp %over% duxA])
+names(duxA_sites)<-paste0("duxA_",1:length(duxA_sites))
+duxA_sites.dna<-getSeq(BSgenome.Hsapiens.UCSC.hg38,duxA_sites+10)
+ggplot() + geom_logo(consensusMatrix(duxA_sites.dna)[1:4,],seq_type='dna') + theme_logo() + ggtitle(paste0 (length(duxA_sites)," motifs under DUXA ATAC regions"))
+dev.off()
+
+
+```
+
+# Tabulate Sites bound by each paralog
+```{r}
+count_tratnnnatya<-function(gr,sites=tratnnnatya) {
+  x<-countOverlaps(gr,sites)
+  x<-as.logical(x)
+  return(sum(x))
+}
+df<-data.frame(total=lengths(peaks),tratnnnatya=unlist(lapply(peaks,count_tratnnnatya)))
+df$tratnnnatya_percent<-round(100*df$tratnnnatya/df$total,0)
+
+df$dux4.sites<-unlist(lapply(peaks,count_tratnnnatya,sites=dux4.sites))
+df$dux4_percent<-round(100*df$dux4.sites/df$total,0)
+
+df$sdux.sites<-unlist(lapply(peaks,count_tratnnnatya,sites=sdux.sites))
+df$sdux_percent<-round(100*df$sdux.sites/df$total,0)
+
+df$duxAvp64.sites<-unlist(lapply(peaks,count_tratnnnatya,sites=duxAvp64.sites))
+df$duxAvp64_percent<-round(100*df$duxAvp64.sites/df$total,0)
+
+mat_temp<-as.matrix(df[c(5:8,9:12),c("tratnnnatya_percent","dux4_percent","duxAvp64_percent","sdux_percent")]) 
+
+col_m=circlize::colorRamp2(c(0,100), c("white", "red"))
+
+svglite::svglite(paste0("motif_heatmap_",ts,".svg"),width=5,height=4)
+Heatmap(mat_temp,col=col_m,cluster_rows = F,cluster_columns = F)
+dev.off()
+
+
+
+
+df[c(1:4,7:8),]
+
+
+
+
+df$percent<-round(100*df$bound/df$total,0)
+
+df<-data.frame(total=lengths(peaks_combined),bound=unlist(lapply(peaks_combined,count_tratnnnatya)))
+df$percent<-round(100*df$bound/df$total,0)
+
+
+#062022 - do the same for meme sites
+length(mega)
+
+mega<-sort(c(dux4.sites,sdux.sites,duxAvp64.sites))
+
+
+
+```
+
+```{r}
+(fls<-list.files("atac_data",pattern = "narrowPeak",full.names = T))
+names(fls)<-fls %>% gsub("atac_data/","",.) %>% gsub(".macsbroad_peaks.narrowPeak","",.)
+
+lengths(peaks<-lapply(fls,narrowPeakToGRanges))
+
+head(peaks)
+seqlengths(Hsapiens)
+peaks[["genome"]]<-GRanges(names(seqlengths(Hsapiens)),IRanges(start=1,end=seqlengths(Hsapiens)),strand="*")
+
+enumerate_class<-function(gr) {
+  sites<-temp[temp %over% gr]
+  sites.dna<-getSeq(BSgenome.Hsapiens.UCSC.hg38,sites)
+  table(factor(case_when(
+  subseq(sites.dna,2,2) == "A" & subseq(sites.dna,10,10) == "C"  ~ "DUX4-like",
+  subseq(sites.dna,2,2) == "G" & subseq(sites.dna,10,10) == "C"  ~ "mDux-like",
+  subseq(sites.dna,2,2) == "A" & subseq(sites.dna,10,10) == "T"  ~ "P3-like",
+  subseq(sites.dna,2,2) == "G" & subseq(sites.dna,10,10) == "T"  ~ "DUX4-like",
+  TRUE ~ "huh?"
+               )))
+}
+
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+x<-lapply(peaks,enumerate_class)
+x[["C98_A"]]["DUX4-like"]<-0
+unlist(x)
+
+bind_rows(x,.id = "sample") %>% 
+  tidyr::gather(class,number_of_sites,-sample) %>% 
+  mutate(number_of_sites=as.integer(number_of_sites)) %>%
+  mutate(sample=factor(sample,levels=c("genome","DUX4_A","DUX4_B","deltaC_A","deltaC_B","DUXA_A","DUXA_B",
+                                      "DuxAVP64_A","DuxAVP64_B","sDux_A","sDux_B","C98_A","C98_B"))) %>% 
+  group_by(sample) %>% 
+  mutate(total=sum(number_of_sites) ) %>% 
+ # mutate(percentage=number_of_sites/total) %>% 
+  ungroup() %>% 
+  mutate(freq=number_of_sites/total) %>% 
+  ggplot(aes(x=sample,y=freq,fill=class)) +
+  geom_bar(stat="identity") + 
+  scale_fill_manual(values=cbPalette[c(2,4,6)]) +
+  geom_text(aes(label = number_of_sites, y=freq), position = "stack") +
+  xlab("") + ggtitle("Frequency of TRATNNNATYA Motif Classes Within Dox-Induced Accessibile Regions") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+# ATAC-Venn
+```{r}
+
+(fls<-list.files("atac_data",pattern = "narrowPeak",full.names = T))
+#length(c98<-interset(narrowPeakToGRanges(fls[1]),narrowPeakToGRanges(fls[2])))
+length(atac_DUX4<-interset(narrowPeakToGRanges(fls[5]),narrowPeakToGRanges(fls[6])))
+names(atac_DUX4)<-paste0("atac_DUX4_",formatC(1:length(atac_DUX4),width=5,format="d",flag="0"))
+
+length(atac_DUXA<-interset(narrowPeakToGRanges(fls[7]),narrowPeakToGRanges(fls[8])))
+names(atac_DUXA)<-paste0("atac_DUXA_",formatC(1:length(atac_DUXA),width=5,format="d",flag="0"))
+
+length(atac_DUXA_VP64<-interset(narrowPeakToGRanges(fls[9]),narrowPeakToGRanges(fls[10])))
+names(atac_DUXA_VP64)<-paste0("atac_DUXA_VP64_",formatC(1:length(atac_DUXA_VP64),width=5,format="d",flag="0"))
+
+length(atac_deltaC<-interset(narrowPeakToGRanges(fls[3]),narrowPeakToGRanges(fls[4])))
+names(atac_deltaC)<-paste0("atac_deltaC_",formatC(1:length(atac_deltaC),width=5,format="d",flag="0"))
+
+length(atac_sDUX<-interset(narrowPeakToGRanges(fls[11]),narrowPeakToGRanges(fls[12])))
+names(atac_sDUX)<-paste0("atac_sDUX_",formatC(1:length(atac_sDUX),width=5,format="d",flag="0"))
+
+pdf(paste0("DUX_Paralog_ATAC_Venn_",ts,".pdf"),width=5,height=4.5)
+grid.newpage()
+VennDiagram::draw.quintuple.venn(area1=length(atac_DUX4),
+                            area2=length(atac_DUXA),
+                            area3=length(atac_DUXA_VP64),
+                            area4=length(atac_deltaC),
+                            area5=length(atac_sDUX),
+                            
+                            n12=length(interset(atac_DUX4,atac_DUXA)),
+                            n13=length(interset(atac_DUX4,atac_DUXA_VP64)),
+                            n14=length(interset(atac_DUX4,atac_deltaC)),
+                            n15=length(interset(atac_DUX4,atac_sDUX)),
+                            
+                            n23=length(interset(atac_DUXA,atac_DUXA_VP64)),
+                            n24=length(interset(atac_DUXA,atac_deltaC)),
+                            n25=length(interset(atac_DUXA,atac_sDUX)),
+                              
+                            n34=length(interset(atac_DUXA_VP64,atac_deltaC)),
+                            n35=length(interset(atac_DUXA_VP64,atac_sDUX)),
+                            n45=length(interset(atac_deltaC,atac_sDUX)),
+                            
+                            n123=length(interset(interset(atac_DUX4,atac_DUXA),atac_DUXA_VP64)),
+                            n124=length(interset(interset(atac_DUX4,atac_DUXA),atac_deltaC)),
+                            n125=length(interset(interset(atac_DUX4,atac_DUXA),atac_sDUX)),
+                            n134=length(interset(interset(atac_DUX4,atac_DUXA_VP64),atac_deltaC)),
+                            n234=length(interset(interset(atac_DUXA,atac_DUXA_VP64),atac_deltaC)),
+                            n235=length(interset(interset(atac_DUXA,atac_DUXA_VP64),atac_sDUX)),
+                            n245=length(interset(interset(atac_DUXA,atac_deltaC),atac_sDUX)),
+                            n345=length(interset(interset(atac_DUXA_VP64,atac_deltaC),atac_sDUX)),
+                            n145=length(interset(interset(atac_DUX4,atac_deltaC),atac_sDUX)),
+                            n135=length(interset(interset(atac_DUX4,atac_DUXA_VP64),atac_sDUX)),
+                            
+                            n1234=length(interset(interset(interset(atac_DUX4,atac_DUXA),atac_DUXA_VP64),atac_deltaC)),
+                            n1345=length(interset(interset(interset(atac_DUX4,atac_DUXA_VP64),atac_deltaC),atac_sDUX)),
+                            n1245=length(interset(interset(interset(atac_DUX4,atac_DUXA),atac_deltaC),atac_sDUX)),
+                            n1235=length(interset(interset(interset(atac_DUX4,atac_DUXA),atac_DUXA_VP64),atac_sDUX)),
+                            n2345=length(interset(interset(interset(atac_DUXA,atac_DUXA_VP64),atac_deltaC),atac_sDUX)),
+                            
+                          n12345=length(interset(interset(interset(interset(atac_DUX4,atac_DUXA),atac_DUXA_VP64),atac_deltaC),atac_sDUX)),
+                            fill=cbPalette[c(3,5,7,8,6)],
+                            category=c("DUX4",
+                                       "DUXA",
+                                       "DUXA-VP64",
+                                       "DeltaC - DUX4",
+                                       "sDUX"))
+dev.off()
+
+
+
+length(composite<-reduce(c(atac_DUX4,atac_DUXA,atac_DUXA_VP64,atac_sDUX)))
+save(composite,file="composite.rdata")
+
+```
+
+# Feb 15,2022 P-values for motif
+```{r}
+(mean_width<-mean(width(atac_DUX4)))
+length(x<-unlist(tileGenome(seqlengths(BSgenome.Hsapiens.UCSC.hg38),tilewidth=mean_width)))
+
+atac_DUX4.dna <-getSeq(BSgenome.Hsapiens.UCSC.hg38,atac_DUX4)
+head(atac_DUX4.dna)
+sum(width(atac_DUX4.dna))
+
+x.subset<-sample(x,length(atac_DUX4))
+names(x.subset)<-paste0("random_DUX4_",formatC(1:length(atac_DUX4),width=5,format="d",flag="0"))
+random_DUX4.dna <-getSeq(BSgenome.Hsapiens.UCSC.hg38,x.subset)
+sum(width(random_DUX4.dna))
+
+export(atac_DUX4.dna,"atac_DUX4.fasta")
+export(random_DUX4.dna,"random_DUX4.fasta")
+
+table(sample(x,length(atac_DUX4)) %over% tratnnnatya.sites)
+
+
+#sDUX
+atac_sDUX.dna<-getSeq(BSgenome.Hsapiens.UCSC.hg38,atac_sDUX)
+head(atac_sDUX.dna)
+sum(width(atac_sDUX.dna))
+(mean_width<-mean(width(atac_sDUX)))
+length(x<-unlist(tileGenome(seqlengths(BSgenome.Hsapiens.UCSC.hg38),tilewidth=mean_width)))
+x.subset<-sample(x,length(atac_sDUX))
+names(x.subset)<-paste0("random2_sDUX_",formatC(1:length(atac_sDUX),width=5,format="d",flag="0"))
+random_sDUX.dna <-getSeq(BSgenome.Hsapiens.UCSC.hg38,x.subset)
+sum(width(random_sDUX.dna))
+export(atac_sDUX.dna,"atac_sDUX.fasta")
+export(random_sDUX.dna,"random_sDUX.fasta")
+
+#DUXA_VP64
+atac_DUXA_VP64.dna<-getSeq(BSgenome.Hsapiens.UCSC.hg38,atac_DUXA_VP64)
+head(atac_DUXA_VP64.dna)
+sum(width(atac_DUXA_VP64.dna))
+(mean_width<-mean(width(atac_DUXA_VP64)))
+length(x<-unlist(tileGenome(seqlengths(BSgenome.Hsapiens.UCSC.hg38),tilewidth=mean_width)))
+x.subset<-sample(x,length(atac_DUXA_VP64))
+names(x.subset)<-paste0("random_DUXA_VP64_",formatC(1:length(atac_DUXA_VP64),width=5,format="d",flag="0"))
+random_DUXA_VP64.dna <-getSeq(BSgenome.Hsapiens.UCSC.hg38,x.subset)
+sum(width(random_DUXA_VP64.dna))
+export(atac_DUXA_VP64.dna,"atac_DUXA_VP64.fasta")
+export(random_DUXA_VP64.dna,"random_DUXA_VP64.fasta")
+
+#DUXA
+atac_DUXA.dna<-getSeq(BSgenome.Hsapiens.UCSC.hg38,atac_DUXA)
+head(atac_DUXA.dna)
+sum(width(atac_DUXA.dna))
+(mean_width<-mean(width(atac_DUXA)))
+length(x<-unlist(tileGenome(seqlengths(BSgenome.Hsapiens.UCSC.hg38),tilewidth=mean_width)))
+x.subset<-sample(x,length(atac_DUXA))
+names(x.subset)<-paste0("random_DUXA_",formatC(1:length(atac_DUXA),width=5,format="d",flag="0"))
+random_DUXA.dna <-getSeq(BSgenome.Hsapiens.UCSC.hg38,x.subset)
+sum(width(random_DUXA.dna))
+export(atac_DUXA.dna,"atac_DUXA.fasta")
+export(random_DUXA.dna,"random_DUXA.fasta")
+
+#DeltaC
+atac_deltaC.dna<-getSeq(BSgenome.Hsapiens.UCSC.hg38,atac_deltaC)
+head(atac_deltaC.dna)
+sum(width(atac_deltaC.dna))
+(mean_width<-mean(width(atac_deltaC)))
+length(x<-unlist(tileGenome(seqlengths(BSgenome.Hsapiens.UCSC.hg38),tilewidth=mean_width)))
+x.subset<-sample(x,length(atac_deltaC))
+names(x.subset)<-paste0("random_deltaC_",formatC(1:length(atac_deltaC),width=5,format="d",flag="0"))
+random_deltaC.dna <-getSeq(BSgenome.Hsapiens.UCSC.hg38,x.subset)
+sum(width(random_deltaC.dna))
+export(atac_deltaC.dna,"atac_deltaC.fasta")
+export(random_deltaC.dna,"random_deltaC.fasta")
+
+
+
+```
+
+
+```{r}
+load("dux_paralogs_atac_Thu_Feb_10_2022_1338.rdata")
+(n<-apply(assays(atac_counts)$counts,2,sum))
+stopifnot(sum(n) > 0)
+
+colnames(assays(atac_counts)$counts)
+df<-assays(atac_counts)$counts[,str_detect(colnames(assays(atac_counts)$counts),"_C_|C98",negate=TRUE)]
+colnames(df)<-gsub("_R1_001.trim.srt.nodup.no_chrM_MT.bam","",colnames(df))
+coldata<-data.frame(dox=sapply(str_split(colnames(df),"_"),function(x) x[2]),
+                    paralog=sapply(str_split(colnames(df),"_"),function(x) x[1]))
+rownames(coldata)<-colnames(df)
+dds_atac<-DESeqDataSetFromMatrix(df,colData=coldata,design=~paralog+dox)
+colData(dds_atac)
+dds_atac_p1<-DESeq2:::plotPCA.DESeqTransform(normTransform(dds_atac),intgroup=c("dox","paralog"),ntop=Inf, returnData=T)
+
+svglite::svglite(paste0("DUX_ATAC_PCA_",ts,".svg"),width=9,height=8)
+dds_atac_p1 %>% 
+  dplyr::mutate(paralog=factor(paralog,levels=c("sDux","Dux4","DuxAVP64","DuxA","DuxB"))) %>% 
+ggplot(aes(x=PC1,y=PC2,color=paralog,shape=dox,label=paralog)) +
+         geom_point(size=2) + 
+         ggtitle("LHCN-M2 ATAC-seq PCA") +
+         xlab(paste0("PC1: ",round(100*attr(dds_atac_p1,"percentVar")[1],0) ,"% variance")) + 
+         ylab(paste0("PC2: ",round(100*attr(dds_atac_p1,"percentVar")[2],0) ,"% variance")) + 
+         ggrepel::geom_text_repel() + 
+         scale_color_manual(values=cbPalette[c(3,4,7,2,8)]) +
+         scale_shape_manual(values = c(21,19)) +
+         theme_bw() 
+dev.off()
+
+```
+
+
+#Do DUX4 and DUX4_deltaC really have limited overlap
+```{r}
+length(DUX4_unique<-atac_DUX4[!atac_DUX4 %over% reduce(c(atac_sDUX,atac_DUXA,atac_DUXA_VP64,atac_deltaC))])
+#enumerate_class(DUX4_unique)
+length(DUX4_DeltaC_unique<-atac_deltaC[!atac_deltaC %over% reduce(c(atac_sDUX,atac_DUXA,atac_DUXA_VP64,atac_DUX4))])
+#enumerate_class(DUX4_unique)
+length(DUX4_common<-interset(atac_DUX4,atac_deltaC))
+#enumerate_class(DUX4_unique)
+
+
+temp1<-peak_center(sample(DUX4_unique,1000))
+temp1$paralog<-"DUX4 unique"
+temp2<-peak_center(sample(DUX4_common,1000))
+temp2$paralog<-"Common"
+temp3<-peak_center(sample(DUX4_DeltaC_unique,1000))
+temp3$paralog<-"DUX4ΔC unique"
+temp<-c(temp1,temp2,temp3)
+summary(width(temp))
+temp$paralog<-factor(temp$paralog,levels=c("DUX4 unique","Common","DUX4ΔC unique"))
+table(temp$paralog)
+
+d1<-rtracklayer::import("atac_data/Dux4_nodox_Thu_Jan_06_2022_1619.bigWig",selection=temp+2000)
+d2<-rtracklayer::import("atac_data/Dux4_plusdox_Thu_Jan_06_2022_1619.bigWig",selection=temp+2000)
+d3<-rtracklayer::import("atac_data/_C_nodox_Thu_Jan_06_2022_1619.bigWig",selection=temp+2000)
+d4<-rtracklayer::import("atac_data/_C_plusdox_Thu_Jan_06_2022_1619.bigWig",selection=temp+2000)
+
+mat_d1 = normalizeToMatrix(d1, temp, value_column = "score",  extend = 2000, mean_mode = "w0", w = 50)
+mat_d2 = normalizeToMatrix(d2, temp, value_column = "score",  extend = 2000, mean_mode = "w0", w = 50)
+mat_d3 = normalizeToMatrix(d3, temp, value_column = "score",  extend = 2000, mean_mode = "w0", w = 50)
+mat_d4 = normalizeToMatrix(d4, temp, value_column = "score",  extend = 2000, mean_mode = "w0", w = 50)
+
+col_fun_d1= colorRamp2(quantile(mat_d2, c(0, 0.99)), c("white", "darkblue"))
+col_fun_d2= colorRamp2(quantile(mat_d2, c(0, 0.99)), c("white", "darkblue"))
+col_fun_d3= colorRamp2(quantile(mat_d4, c(0, 0.99)), c("white", "darkred"))
+col_fun_d4= colorRamp2(quantile(mat_d4, c(0, 0.99)), c("white", "darkred"))
+col=c("blue","green","red")
+
+EnrichedHeatmap(mat_d1, col = col_fun_d1, name = "DUX4 nodox",column_title = "DUX4 ATAC nodox",
+                axis_name_rot = 90,split=temp$paralog,pos_line=F,column_title_rot=90,
+                show_heatmap_legend = FALSE,
+             top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col),ylim=c(0,1.3),yaxis = F)),
+              use_raster=TRUE, raster_device="png",raster_quality=10) +
+  
+EnrichedHeatmap(mat_d2, col = col_fun_d2, name = "DUX4 dox",column_title = "DUX4 ATAC dox",
+                axis_name_rot = 90,split=temp$paralog,pos_line=F,column_title_rot=90,show_heatmap_legend = TRUE,
+                top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col),ylim=c(0,1.3),yaxis = F)),
+                use_raster=TRUE, raster_device="png", raster_quality=10) +
+  
+EnrichedHeatmap(mat_d3, col = col_fun_d3, name = "DUX4ΔC nodox",column_title = "DUX4ΔC ATAC nodox",
+                axis_name_rot = 90,split=temp$paralog,pos_line=F,column_title_rot=90,
+                show_heatmap_legend = FALSE,
+             top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col),ylim=c(0,1.3),yaxis = F)),
+              use_raster=TRUE, raster_device="png",raster_quality=10) +
+  
+EnrichedHeatmap(mat_d4, col = col_fun_d4, name = "DUX4ΔC dox",column_title = "DUX4ΔC ATAC dox",
+                axis_name_rot = 90,split=temp$paralog,pos_line=F,column_title_rot=90,show_heatmap_legend = TRUE,
+                top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col),ylim=c(0,1.3),yaxis = F)),
+                use_raster=TRUE, raster_device="png", raster_quality=10)
+
+
+```
+
+#Add DUXA and DUXA-VP64
+```{r}
+length(DUXA_unique<-atac_DUXA[!atac_DUXA %over% reduce(c(atac_sDUX,atac_DUX4,atac_DUXA_VP64,atac_deltaC))])
+length(DUXA_VP64_unique<-atac_DUXA_VP64[!atac_DUXA_VP64  %over% reduce(c(atac_sDUX,atac_DUXA,atac_deltaC,atac_DUX4))])
+length(DUXA_common<-interset(atac_DUXA,atac_DUXA_VP64))
+
+temp1<-peak_center(DUXA_unique)
+temp1$paralog<-"DUXA unique"
+temp2<-peak_center(DUXA_VP64_unique)
+temp2$paralog<-"DUXA-VP64 unique"
+temp3<-peak_center(DUXA_common)
+temp3$paralog<-"Common"
+
+temp<-c(temp1,temp2,temp3)
+temp$paralog<-factor(temp$paralog,levels=c("DUXA unique","Common","DUXA-VP64 unique"))
+summary(width(temp))
+table(temp$paralog)
+length(temp)
+
+d1<-rtracklayer::import("atac_data/DuxA_nodox_Thu_Jan_06_2022_1619.bigWig",selection=temp+2000)
+d2<-rtracklayer::import("atac_data/DuxA_plusdox_Thu_Jan_06_2022_1619.bigWig",selection=temp+2000)
+d3<-rtracklayer::import("atac_data/DuxAVP64_nodox_Thu_Jan_06_2022_1619.bigWig",selection=temp+2000)
+d4<-rtracklayer::import("atac_data/DuxAVP64_plusdox_Thu_Jan_06_2022_1619.bigWig",selection=temp+2000)
+
+mat_d1 = normalizeToMatrix(d1, temp, value_column = "score",  extend = 2000, mean_mode = "w0", w = 50)
+mat_d2 = normalizeToMatrix(d2, temp, value_column = "score",  extend = 2000, mean_mode = "w0", w = 50)
+mat_d3 = normalizeToMatrix(d3, temp, value_column = "score",  extend = 2000, mean_mode = "w0", w = 50)
+mat_d4 = normalizeToMatrix(d4, temp, value_column = "score",  extend = 2000, mean_mode = "w0", w = 50)
+
+col_fun_d1= colorRamp2(quantile(mat_d2, c(0, 0.99)), c("white", "darkblue"))
+col_fun_d2= colorRamp2(quantile(mat_d2, c(0, 0.99)), c("white", "darkblue"))
+col_fun_d3= colorRamp2(quantile(mat_d4, c(0, 0.99)), c("white", "darkred"))
+col_fun_d4= colorRamp2(quantile(mat_d4, c(0, 0.99)), c("white", "darkred"))
+col=c("blue","green","red")
+
+EnrichedHeatmap(mat_d1, col = col_fun_d1, name = "DUXA nodox",column_title = "DUXA  nodox",
+                axis_name_rot = 90,split=temp$paralog,pos_line=F,column_title_rot=90,
+                show_heatmap_legend = FALSE,
+             top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col),ylim=c(0,1.3),yaxis = F)),
+              use_raster=TRUE, raster_device="png",raster_quality=10) +
+  
+EnrichedHeatmap(mat_d2, col = col_fun_d2, name = "DUXA dox",column_title = "DUXA  dox",
+                axis_name_rot = 90,split=temp$paralog,pos_line=F,column_title_rot=90,show_heatmap_legend = TRUE,
+                top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col),ylim=c(0,1.3),yaxis = F)),
+                use_raster=TRUE, raster_device="png", raster_quality=10) +
+  
+EnrichedHeatmap(mat_d3, col = col_fun_d3, name = "DUXA-VP64 nodox",column_title = "DUXA-VP64 nodox",
+                axis_name_rot = 90,split=temp$paralog,pos_line=F,column_title_rot=90,
+                show_heatmap_legend = FALSE,
+             top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col),ylim=c(0,1.3),yaxis = F)),
+              use_raster=TRUE, raster_device="png",raster_quality=10) +
+  
+EnrichedHeatmap(mat_d4, col = col_fun_d4, name = "DUXA-VP64 dox",column_title = "DUXA-VP64 dox",
+                axis_name_rot = 90,split=temp$paralog,pos_line=F,column_title_rot=90,show_heatmap_legend = TRUE,
+                top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col),ylim=c(0,1.3),yaxis = F)),
+                use_raster=TRUE, raster_device="png", raster_quality=10)
+
+```
+
+```{r}
+length(pax3_like<-reduce(c(atac_DUXA,atac_DUXA_VP64,atac_sDUX)))
+dux4_like<-interset(atac_DUX4,atac_deltaC)
+length(dux4_like<-dux4_like[!dux4_like %over% pax3_like])
+enumerate_class(dux4_like)
+
+
+length(sDUX_unique<-atac_sDUX[!atac_sDUX %over% reduce(c(atac_DUX4,atac_DUXA,atac_DUXA_VP64,atac_deltaC))])
+enumerate_class(sDUX_unique)
+
+length(DUX4_unique<-atac_DUX4[!atac_DUX4 %over% reduce(c(atac_sDUX,atac_DUXA,atac_DUXA_VP64,atac_deltaC))])
+enumerate_class(DUX4_unique)
+
+length(DUXA_VP64_unique<-atac_DUXA_VP64[!atac_DUXA_VP64 %over% reduce(c(atac_sDUX,atac_DUX4,atac_deltaC))])
+enumerate_class(DUXA_VP64_unique)
+
+```
+
+```{r}
+
+ch = import.chain("../../R_RESOURCES/hg19ToHg38.over.chain")
+epic_hg19<-import("~/Downloads/truseq-methyl-capture-epic-manifest-file.bed")
+epic = unlist(liftOver(epic_hg19, ch))
+View(as.data.frame(epic))
+export(epic,"../../../hTS Project/epic_hg38.bed")
+
+```
+
+
+```{r}
+annotate_peaks<-function(gr,tx=transcripts,cutoff=500000,collapse=TRUE) {
+  #seqlevelsStyle(gr)<-"NCBI"
+  #gr<-gr[!gr %over% el_mm10]
+  
+  gr_anno<-annotatePeakInBatch(gr, AnnotationData=tx, output="both", maxgap=500L)
+  #seqlevelsStyle(gr_anno)<-"NCBI"
+  #length(gr_anno<-subset(gr_anno, shortestDistance < cutoff))
+  #seqlevelsStyle(gr_anno)<-"NCBI"
+  
+  gr_anno$symbol<-tx$symbol[match(gr_anno$feature,names(tx))]
+  gr_anno$gene_id<-tx$gene_id[match(gr_anno$feature,names(tx))]
+  
+  if (collapse == F) return(gr_anno)
+  x<-mcols(gr_anno) %>% as.data.frame %>%
+  dplyr::filter(symbol!="") %>% 
+  dplyr::group_by(peak) %>%
+  summarize(gene=paste(unique(symbol),collapse=";")) %>% 
+    ungroup() %>% 
+    as.data.frame
+  
+  gr$genes<-x[match(names(gr),x$peak),"gene"]
+  #gr$wls<-wls(gr)
+  #gr<-gr[with(gr,order(-score))]
+  
+  #return chacter vector of peaks associated with each ENSEMBL ID
+  return(gr)
+  
+}
+
+
+gr<-DUX4_unique
+names(gr)<-paste0("atac_",1:length(gr))
+
+
+```
+
+## 091522 start from here
+annotate atac peaks with genes we know are upreguated in that dataset
+```{r}
+d=10000
+length(deg_DUX4_unique<-deg_DUX4_up[!deg_DUX4_up %in% c(deg_DUXA_up,deg_DUXB_up,deg_DUXA_VP64_up,deg_sDUX_up)])
+length(temp_transcripts<-subset(transcripts,gene_id %in% deg_DUX4_unique))
+temp_transcripts$size<-width(temp_transcripts)
+temp_transcripts[grep("KIF1B",temp_transcripts$symbol)]
+temp_transcripts<-temp_transcripts[with(temp_transcripts,order(-size))]
+length(temp_transcripts_dedup<-temp_transcripts[!duplicated(temp_transcripts$gene_id)])
+temp_transcripts_dedup[grep("KIF1B",temp_transcripts_dedup$symbol)]
+strand(temp_transcripts_dedup)<-"*"
+
+
+head(names(DUX4_unique)<-paste0("d4u_",formatC(1:length(DUX4_unique),width=5,format="d",flag="0")))
+length(DUX4_unique_anno<-annotate_peaks(DUX4_unique, tx = temp_transcripts_dedup, cutoff = Inf,collapse=F))
+length(unique(DUX4_unique_anno$gene_id))
+
+length(na.omit(unique(DUX4_unique_anno$gene_id)))
+length(DUX4_unique_anno[DUX4_unique_anno$distancetoFeature <= d,])
+length(unique(DUX4_unique_anno[DUX4_unique_anno$distancetoFeature <= d,]$gene_id))
+length(DUX4_unique_anno[DUX4_unique_anno$distancetoFeature <= d,])
+#View(as.data.frame(DUX4_unique_anno))
+
+
+```
+
+#sDUX
+```{r}
+
+length(deg_sDUX_unique<-deg_sDUX_up[!deg_sDUX_up %in% c(deg_DUXA_up,deg_DUXB_up,deg_DUXA_VP64_up,deg_DUX4_up)])
+length(temp_transcripts<-subset(transcripts,gene_id %in% deg_sDUX_unique))
+temp_transcripts$size<-width(temp_transcripts)
+temp_transcripts[grep("TGFB2",temp_transcripts$symbol)]
+temp_transcripts<-temp_transcripts[with(temp_transcripts,order(-size))]
+length(temp_transcripts_dedup<-temp_transcripts[!duplicated(temp_transcripts$gene_id)])
+temp_transcripts_dedup[grep("TGFB2",temp_transcripts_dedup$symbol)]
+strand(temp_transcripts_dedup)<-"*"
+
+
+head(names(sDUX_unique)<-paste0("sdu_",formatC(1:length(sDUX_unique),width=5,format="d",flag="0")))
+length(sDUX_unique_anno<-annotate_peaks(sDUX_unique, tx = temp_transcripts_dedup, cutoff = Inf,collapse=F))
+sDUX_unique_anno<-sDUX_unique_anno[!is.na(sDUX_unique_anno$distancetoFeature)]
+length(na.omit(unique(sDUX_unique_anno$gene_id)))
+length(sDUX_unique_anno[sDUX_unique_anno$distancetoFeature <= d,])
+length(unique(sDUX_unique_anno[sDUX_unique_anno$distancetoFeature <= d,]$gene_id))
+length(sDUX_unique_anno[sDUX_unique_anno$distancetoFeature <= d,])
+
+#View(as.data.frame(sDUX_unique_anno))
+```
+
+#DUXA_VP64
+```{r}
+length(deg_DUXA_VP64_unique<-deg_DUXA_VP64_up[!deg_DUXA_VP64_up %in% c(deg_DUXA_up,deg_DUXB_up,deg_sDUX_up,deg_DUX4_up)])
+length(temp_transcripts<-subset(transcripts,gene_id %in% deg_DUXA_VP64_unique))
+temp_transcripts$size<-width(temp_transcripts)
+temp_transcripts[grep("OTX1",temp_transcripts$symbol)]
+temp_transcripts<-temp_transcripts[with(temp_transcripts,order(-size))]
+length(temp_transcripts_dedup<-temp_transcripts[!duplicated(temp_transcripts$gene_id)])
+temp_transcripts_dedup[grep("OTX1",temp_transcripts_dedup$symbol)]
+strand(temp_transcripts_dedup)<-"*"
+
+
+head(names(DUXA_VP64_unique)<-paste0("davp64_",formatC(1:length(DUXA_VP64_unique),width=5,format="d",flag="0")))
+length(DUXA_VP64_unique_anno<-annotate_peaks(DUXA_VP64_unique, tx = temp_transcripts_dedup, cutoff = Inf,collapse=F))
+length(unique(DUXA_VP64_unique_anno$gene_id))
+
+length(na.omit(unique(DUXA_VP64_unique_anno$gene_id)))
+length(DUXA_VP64_unique_anno[DUXA_VP64_unique_anno$distancetoFeature <= d,])
+length(unique(DUXA_VP64_unique_anno[DUXA_VP64_unique_anno$distancetoFeature <= d,]$gene_id))
+length(DUXA_VP64_unique_anno[DUXA_VP64_unique_anno$distancetoFeature <= d,])
+
+#View(as.data.frame(DUXA_VP64_unique_anno))
+```
+
+#combine by peak
+```{r}
+DUXA_VP64_unique_anno$dataset<-"DUXA_VP64"
+sDUX_unique_anno$dataset<-"sDUX"
+DUX4_unique_anno$dataset<-"DUX4"
+
+my_unique<-c(sample(DUX4_unique_anno[DUX4_unique_anno$distancetoFeature <= d,],500),
+             DUXA_VP64_unique_anno[DUXA_VP64_unique_anno$distancetoFeature <= d,],
+             sDUX_unique_anno[sDUX_unique_anno$distancetoFeature <= d,])
+table(my_unique$dataset)
+my_unique.center<-peak_center(my_unique)
+my_unique.center$dataset<-factor(my_unique$dataset,levels=c("DUX4","sDUX","DUXA_VP64"))
+table(my_unique.center$dataset)
+
+
+d1<-rtracklayer::import("atac_data/Dux4_nodox_Thu_Jan_06_2022_1619.bigWig",selection=my_unique.center+5000)
+d2<-rtracklayer::import("atac_data/Dux4_plusdox_Thu_Jan_06_2022_1619.bigWig",selection=my_unique.center+5000)
+d3<-rtracklayer::import("atac_data/DuxAVP64_nodox_Thu_Jan_06_2022_1619.bigWig",selection=my_unique.center+5000)
+d4<-rtracklayer::import("atac_data/DuxAVP64_plusdox_Thu_Jan_06_2022_1619.bigWig",selection=my_unique.center+5000)
+d5<-rtracklayer::import("atac_data/sDux_nodox_Thu_Jan_06_2022_1619.bigWig",selection=my_unique.center+5000)
+d6<-rtracklayer::import("atac_data/sDux_plusdox_Thu_Jan_06_2022_1619.bigWig",selection=my_unique.center+5000)
+
+d1<-keepStandardChromosomes(d1)
+d2<-keepStandardChromosomes(d2)
+d3<-keepStandardChromosomes(d3)
+d4<-keepStandardChromosomes(d4)
+d5<-keepStandardChromosomes(d5)
+d6<-keepStandardChromosomes(d6)
+
+mat_d1 = normalizeToMatrix(d1, my_unique.center, value_column = "score",  extend = 5000, mean_mode = "w0", w = 50)
+mat_d2 = normalizeToMatrix(d2, my_unique.center, value_column = "score",  extend = 5000, mean_mode = "w0", w = 50)
+mat_d3 = normalizeToMatrix(d3, my_unique.center, value_column = "score",  extend = 5000, mean_mode = "w0", w = 50)
+mat_d4 = normalizeToMatrix(d4, my_unique.center, value_column = "score",  extend = 5000, mean_mode = "w0", w = 50)
+mat_d5 = normalizeToMatrix(d5, my_unique.center, value_column = "score",  extend = 5000, mean_mode = "w0", w = 50)
+mat_d6 = normalizeToMatrix(d6, my_unique.center, value_column = "score",  extend = 5000, mean_mode = "w0", w = 50)
+
+col_fun_d1= colorRamp2(quantile(mat_d2, c(0, 0.99)), c("white", "darkblue"))
+col_fun_d2= colorRamp2(quantile(mat_d2, c(0, 0.99)), c("white", "darkblue"))
+col_fun_d3= colorRamp2(quantile(mat_d4, c(0, 0.99)), c("white", "darkblue"))
+col_fun_d4= colorRamp2(quantile(mat_d4, c(0, 0.99)), c("white", "darkblue"))
+col_fun_d5= colorRamp2(quantile(mat_d6, c(0, 0.99)), c("white", "darkblue"))
+col_fun_d6= colorRamp2(quantile(mat_d6, c(0, 0.99)), c("white", "darkblue"))
+
+col=c("blue","green","red")
+
+EnrichedHeatmap(mat_d1, col = col_fun_d1, name = "DUX4 nodox",column_title = "DUX4 ATAC\n nodox",
+                axis_name_rot = 90,split=my_unique.center$dataset, pos_line=F,column_title_rot=0,
+                show_heatmap_legend = FALSE, top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col),ylim = c(0, 1.25))),
+              use_raster=TRUE, raster_device="png",raster_quality=10) +
+  
+EnrichedHeatmap(mat_d2, col = col_fun_d2, name = "DUX4 dox",column_title = "DUX4 ATAC\n dox",
+                axis_name_rot = 90,split=my_unique.center$dataset,pos_line=F,column_title_rot=0,show_heatmap_legend = TRUE,
+                top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col), ylim = c(0, 1.25))),
+                use_raster=TRUE, raster_device="png", raster_quality=10) +
+  
+EnrichedHeatmap(mat_d5, col = col_fun_d5, name = "sDUX nodox",column_title = "sDUX ATAC\n nodox",
+                axis_name_rot = 90,split=my_unique.center$dataset, pos_line=F,column_title_rot=0,
+                show_heatmap_legend = FALSE, top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col), ylim = c(0, 1.25))),
+              use_raster=TRUE, raster_device="png",raster_quality=10) +
+  
+EnrichedHeatmap(mat_d6, col = col_fun_d6, name = "sDUX dox",column_title = "sDUX ATAC\n dox",
+                axis_name_rot = 90,split=my_unique.center$dataset,pos_line=F,column_title_rot=0,
+                show_heatmap_legend = TRUE,top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col), ylim = c(0, 1.25))),
+                use_raster=TRUE, raster_device="png", raster_quality=10) +
+  
+EnrichedHeatmap(mat_d3, col = col_fun_d3, name = "DUXAVP64 nodox",column_title = "DUXA-VP64 ATAC\n nodox",
+                axis_name_rot = 90,split=my_unique.center$dataset, pos_line=F,column_title_rot=0,
+                show_heatmap_legend = FALSE, top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col), ylim = c(0, 1.25))),
+              use_raster=TRUE, raster_device="png",raster_quality=10) +
+  
+EnrichedHeatmap(mat_d4, col = col_fun_d4, name = "DUXAVP64 dox",column_title = "DUXA-VP64 ATAC\n dox",
+                axis_name_rot = 90,split=my_unique.center$dataset,pos_line=F,column_title_rot=0,show_heatmap_legend = TRUE,
+                top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col), ylim = c(0, 1.25))),
+                use_raster=TRUE, raster_device="png", raster_quality=10)
+  
+
+  
+```
+
+
+
+#combine by gene_id
+```{r}
+sum(is.na(sDUX_unique_anno$gene_id))
+sum(is.na(DUX4_unique_anno$gene_id))
+sum(is.na(DUXA_VP64_unique_anno$gene_id))
+
+x2<-list(davp64=na.omit(unique(DUXA_VP64_unique_anno[DUXA_VP64_unique_anno$distancetoFeature <= d,]$gene_id)),
+         dux4=na.omit(unique(DUX4_unique_anno[DUX4_unique_anno$distancetoFeature <= d,]$gene_id)),
+         sdux=na.omit(unique(sDUX_unique_anno[sDUX_unique_anno$distancetoFeature <= d,]$gene_id)))
+lengths(x2)
+
+x2<-purrr::map_df(x2, as.data.frame,.id = 'paralog')
+colnames(x2)<-c("paralog","gene_id")
+x2$paralog<-factor(x2$paralog,levels=c("sdux","davp64","dux4"))
+table(x2$paralog)
+
+head(x2)
+x2$lfc_sDUX<-res_sDUX[match(x2$gene_id,res_sDUX$gene_id),"log2FoldChange"]
+x2$lfc_DUX4<-res_DUX4[match(x2$gene_id,res_DUX4$gene_id),"log2FoldChange"]
+x2$lfc_DUXA_VP64<-res_DUXA_VP64[match(x2$gene_id,res_DUXA_VP64$gene_id),"log2FoldChange"]
+
+head(as.matrix(x2[,c("lfc_sDUX", "lfc_DUX4", "lfc_DUXA_VP64")]))
+sum(is.na(as.matrix(x2[,c("lfc_sDUX", "lfc_DUX4", "lfc_DUXA_VP64")])))
+x2[is.na(rowSums(as.matrix(x2[,c("lfc_sDUX", "lfc_DUX4", "lfc_DUXA_VP64")]))),]
+
+Heatmap(as.matrix(x2[,c("lfc_sDUX", "lfc_DUX4", "lfc_DUXA_VP64")]), name="log2fc", col=c("green","white","purple"), split=x2$paralog, cluster_columns =FALSE, cluster_row_slices=TRUE, show_row_dend=TRUE, width = unit(10, "mm")) 
+
+x2<-left_join(x2,f_mean_lhcnm2[,c("gene_id","DUX4cont","DUXA_VP64cont","sDUXcont",
+                                       "DUX4dox","DUXA_VP64dox","sDUXdox")],by="gene_id")
+x2mat<-log2(as.matrix(x2[,c("DUX4cont","DUXA_VP64cont","sDUXcont",
+                                       "DUX4dox","DUXA_VP64dox","sDUXdox")])+0.1)
+
+table(x2$paralog)
+x2$paralog<-factor(x2$paralog,levels=rev(c("sdux","davp64","dux4")))
+Heatmap(x2mat[,1:3], name="log2FPKM", col=c("white","red"), split=x2$paralog, cluster_columns =FALSE, cluster_row_slices=FALSE, show_row_dend=FALSE, width = unit(40, "mm")) +
+Heatmap(x2mat[,4:6], name="log2FPKM", col=c("white","red"), split=x2$paralog, cluster_columns =FALSE, cluster_row_slices=FALSE, show_row_dend=FALSE, width = unit(40, "mm")) 
+
+
+length(temp_transcripts<-subset(transcripts,gene_id %in% x2$gene_id))
+temp_transcripts$size<-width(temp_transcripts)
+temp_transcripts[grep("ENSG00000054523.19",temp_transcripts$gene_id)]
+temp_transcripts<-temp_transcripts[with(temp_transcripts,order(-size))]
+length(temp_transcripts_dedup<-temp_transcripts[!duplicated(temp_transcripts$gene_id)])
+temp_transcripts_dedup[grep("ENSG00000054523.19",temp_transcripts_dedup$gene_id)]
+
+names(temp_transcripts_dedup)<-temp_transcripts_dedup$gene_id
+temp_transcripts_dedup<-keepStandardChromosomes(temp_transcripts_dedup,pruning.mode = "coarse")
+length(temp_transcripts_dedup)
+
+dim(x2)
+temp_transcripts_dedup<-temp_transcripts_dedup[x2$gene_id]
+temp_transcripts_dedup$paralog<-x2$paralog
+
+
+d1<-rtracklayer::import("atac_data/Dux4_nodox_Thu_Jan_06_2022_1619.bigWig",selection=temp_transcripts_dedup+10000)
+d2<-rtracklayer::import("atac_data/Dux4_plusdox_Thu_Jan_06_2022_1619.bigWig",selection=temp_transcripts_dedup+10000)
+d3<-rtracklayer::import("atac_data/DuxAVP64_nodox_Thu_Jan_06_2022_1619.bigWig",selection=temp_transcripts_dedup+10000)
+d4<-rtracklayer::import("atac_data/DuxAVP64_plusdox_Thu_Jan_06_2022_1619.bigWig",selection=temp_transcripts_dedup+10000)
+d5<-rtracklayer::import("atac_data/sDux_nodox_Thu_Jan_06_2022_1619.bigWig",selection=temp_transcripts_dedup+10000)
+d6<-rtracklayer::import("atac_data/sDux_plusdox_Thu_Jan_06_2022_1619.bigWig",selection=temp_transcripts_dedup+10000)
+
+d1<-keepStandardChromosomes(d1)
+d2<-keepStandardChromosomes(d2)
+d3<-keepStandardChromosomes(d3)
+d4<-keepStandardChromosomes(d4)
+d5<-keepStandardChromosomes(d5)
+d6<-keepStandardChromosomes(d6)
+
+mat_d1 = normalizeToMatrix(d1, temp_transcripts_dedup, value_column = "score",  extend = 10000, mean_mode = "w0", w = 50)
+mat_d2 = normalizeToMatrix(d2, temp_transcripts_dedup, value_column = "score",  extend = 10000, mean_mode = "w0", w = 50)
+mat_d3 = normalizeToMatrix(d3, temp_transcripts_dedup, value_column = "score",  extend = 10000, mean_mode = "w0", w = 50)
+mat_d4 = normalizeToMatrix(d4, temp_transcripts_dedup, value_column = "score",  extend = 10000, mean_mode = "w0", w = 50)
+mat_d5 = normalizeToMatrix(d5, temp_transcripts_dedup, value_column = "score",  extend = 10000, mean_mode = "w0", w = 50)
+mat_d6 = normalizeToMatrix(d6, temp_transcripts_dedup, value_column = "score",  extend = 10000, mean_mode = "w0", w = 50)
+
+col_fun_d1= colorRamp2(quantile(mat_d2, c(0, 0.99)), c("white", "darkblue"))
+col_fun_d2= colorRamp2(quantile(mat_d2, c(0, 0.99)), c("white", "darkblue"))
+col_fun_d3= colorRamp2(quantile(mat_d4, c(0, 0.99)), c("white", "darkblue"))
+col_fun_d4= colorRamp2(quantile(mat_d4, c(0, 0.99)), c("white", "darkblue"))
+col_fun_d5= colorRamp2(quantile(mat_d6, c(0, 0.99)), c("white", "darkblue"))
+col_fun_d6= colorRamp2(quantile(mat_d6, c(0, 0.99)), c("white", "darkblue"))
+
+col=c("blue","green","red")
+
+Heatmap(x2mat[,1:3], name="log2FPKM nodox", col=c("white","red"), split=x2$paralog,show_heatmap_legend = FALSE, cluster_columns =FALSE, cluster_row_slices=FALSE, show_row_dend=FALSE, width = unit(10, "mm")) +
+Heatmap(x2mat[,4:6], name="log2FPKM dox", col=c("white","red"), split=x2$paralog, cluster_columns =FALSE, cluster_row_slices=FALSE, show_row_dend=FALSE, width = unit(10, "mm")) +
+EnrichedHeatmap(mat_d1, col = col_fun_d1, name = "DUX4 nodox",column_title = "DUX4 ATAC\n nodox",
+                axis_name_rot = 90,split=temp_transcripts_dedup$paralog, pos_line=F,column_title_rot=90,
+                show_heatmap_legend = FALSE, top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col))),
+              use_raster=TRUE, raster_device="png",raster_quality=10) +
+  
+EnrichedHeatmap(mat_d2, col = col_fun_d2, name = "DUX4 dox",column_title = "DUX4 ATAC\n dox",
+                axis_name_rot = 90,split=x2$paralog,pos_line=F,column_title_rot=90,show_heatmap_legend = TRUE,
+                top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col))),
+                use_raster=TRUE, raster_device="png", raster_quality=10) +
+EnrichedHeatmap(mat_d3, col = col_fun_d3, name = "DUXAVP64 nodox",column_title = "DUXAVP64 ATAC\n nodox",
+                axis_name_rot = 90,split=temp_transcripts_dedup$paralog, pos_line=F,column_title_rot=90,
+                show_heatmap_legend = FALSE, top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col))),
+              use_raster=TRUE, raster_device="png",raster_quality=10) +
+  
+EnrichedHeatmap(mat_d4, col = col_fun_d4, name = "DUXAVP64 dox",column_title = "DUXAVP64 ATAC\n dox",
+                axis_name_rot = 90,split=x2$paralog,pos_line=F,column_title_rot=90,show_heatmap_legend = FALSE,
+                top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col))),
+                use_raster=TRUE, raster_device="png", raster_quality=10) +
+EnrichedHeatmap(mat_d5, col = col_fun_d5, name = "sDUX nodox",column_title = "sDUX ATAC\n nodox",
+                axis_name_rot = 90,split=temp_transcripts_dedup$paralog, pos_line=F,column_title_rot=90,
+                show_heatmap_legend = FALSE, top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col))),
+              use_raster=TRUE, raster_device="png",raster_quality=10) +
+  
+EnrichedHeatmap(mat_d6, col = col_fun_d6, name = "sDUX dox",column_title = "sDUX ATAC\n dox",
+                axis_name_rot = 90,split=x2$paralog,pos_line=F,column_title_rot=90,show_heatmap_legend = FALSE,
+                top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col))),
+                use_raster=TRUE, raster_device="png", raster_quality=10) 
+  
+```
+
+
+#DUX4 alone
+```{r}
+x_DUX4<-data.frame(gene_id=deg_DUX4_up) %>% 
+  left_join(f_mean_lhcnm2[,c("gene_id","DUX4cont","DUX4dox")],by="gene_id") %>% 
+  left_join(res_DUX4[,c("gene_id","log2FoldChange")]) %>% 
+  arrange(desc(log2FoldChange)) %>% 
+  mutate(DUX4cont=log2(DUX4cont+0.1)) %>% 
+  mutate(DUX4dox=log2(DUX4dox+0.1)) 
+
+head(x_DUX4)
+nrow(x_DUX4)
+
+#x_DUX4<-x_DUX4[with(x_DUX4,order(DUX4dox/DUX4cont)),]
+length(temp_transcripts<-subset(transcripts,gene_id %in% x_DUX4$gene_id))
+temp_transcripts$size<-width(temp_transcripts)
+temp_transcripts<-temp_transcripts[with(temp_transcripts,order(-size))]
+length(temp_transcripts_dedup<-temp_transcripts[!duplicated(temp_transcripts$gene_id)])
+names(temp_transcripts_dedup)<-temp_transcripts_dedup$gene_id
+#temp_transcripts_dedup<-keepStandardChromosomes(temp_transcripts_dedup,pruning.mode = "coarse")
+length(temp_transcripts_dedup)
+temp_transcripts_dedup<-temp_transcripts_dedup[x_DUX4$gene_id]
+
+d5<-rtracklayer::import("atac_data/Dux4_nodox_Thu_Jan_06_2022_1619.bigWig",selection=temp_transcripts_dedup+10000)
+d6<-rtracklayer::import("atac_data/Dux4_plusdox_Thu_Jan_06_2022_1619.bigWig",selection=temp_transcripts_dedup+10000)
+
+mat_d5 = normalizeToMatrix(d5, temp_transcripts_dedup, value_column = "score",  extend = 10000, mean_mode = "w0", w = 50)
+mat_d6 = normalizeToMatrix(d6, temp_transcripts_dedup, value_column = "score",  extend = 10000, mean_mode = "w0", w = 50)
+
+col_fun_d5= colorRamp2(quantile(mat_d6, c(0, 0.99)), c("white", "darkblue"))
+col_fun_d6= colorRamp2(quantile(mat_d6, c(0, 0.99)), c("white", "darkblue"))
+
+
+Heatmap(as.matrix(x_DUX4[,2:3]), name="log2FPKM", col=c("white","red"),show_heatmap_legend = TRUE, cluster_columns =FALSE, cluster_row_slices=TRUE, show_row_dend=FALSE, width = unit(10, "mm")) +
+
+EnrichedHeatmap(mat_d5, col = col_fun_d5, name = "DUX4 nodox",column_title = "DUX4 ATAC\n nodox",
+                axis_name_rot = 90, pos_line=T,column_title_rot=0,
+                show_heatmap_legend = FALSE, 
+                 top_annotation = HeatmapAnnotation(lines = anno_enriched(gp=gpar(col=col), ylim = c(0, 2.5), 
+                                                                          axis_param= list(side ="right",facing = "inside"))),
+              use_raster=TRUE, raster_device="png",raster_quality=10) +
+  
+EnrichedHeatmap(mat_d6, col = col_fun_d6, name = "DUX4 dox",column_title = "DUX4 ATAC\n dox",
+                axis_name_rot = 90,pos_line=T,column_title_rot=0,show_heatmap_legend = TRUE,
+                 top_annotation = HeatmapAnnotation(lines = anno_enriched(gp=gpar(col=col), ylim = c(0, 2.5), 
+                                                                          axis_param= list(side ="right",facing = "inside"))),
+                use_raster=TRUE, raster_device="png", raster_quality=10) 
+  
+```
+
+
+
+#sDUX alone
+```{r}
+x_sDUX<-data.frame(gene_id=deg_sDUX_up) %>% 
+  left_join(f_mean_lhcnm2[,c("gene_id","sDUXcont","sDUXdox")],by="gene_id") %>% 
+  left_join(res_sDUX[,c("gene_id","log2FoldChange")]) %>% 
+  arrange(desc(log2FoldChange)) %>% 
+  mutate(sDUXcont=log2(sDUXcont+0.1)) %>% 
+  mutate(sDUXdox=log2(sDUXdox+0.1)) 
+
+head(x_sDUX)
+
+#x_sDUX<-x_sDUX[with(x_sDUX,order(sDUXdox/sDUXcont)),]
+length(temp_transcripts<-subset(transcripts,gene_id %in% x_sDUX$gene_id))
+temp_transcripts$size<-width(temp_transcripts)
+temp_transcripts<-temp_transcripts[with(temp_transcripts,order(-size))]
+length(temp_transcripts_dedup<-temp_transcripts[!duplicated(temp_transcripts$gene_id)])
+names(temp_transcripts_dedup)<-temp_transcripts_dedup$gene_id
+#temp_transcripts_dedup<-keepStandardChromosomes(temp_transcripts_dedup,pruning.mode = "coarse")
+length(temp_transcripts_dedup)
+temp_transcripts_dedup<-temp_transcripts_dedup[x_sDUX$gene_id]
+
+d5<-rtracklayer::import("atac_data/sDux_nodox_Thu_Jan_06_2022_1619.bigWig",selection=temp_transcripts_dedup+10000)
+d6<-rtracklayer::import("atac_data/sDux_plusdox_Thu_Jan_06_2022_1619.bigWig",selection=temp_transcripts_dedup+10000)
+
+mat_d5 = normalizeToMatrix(d5, temp_transcripts_dedup, value_column = "score",  extend = 10000, mean_mode = "w0", w = 50)
+mat_d6 = normalizeToMatrix(d6, temp_transcripts_dedup, value_column = "score",  extend = 10000, mean_mode = "w0", w = 50)
+
+col_fun_d5= colorRamp2(quantile(mat_d6, c(0, 0.99)), c("white", "darkblue"))
+col_fun_d6= colorRamp2(quantile(mat_d6, c(0, 0.99)), c("white", "darkblue"))
+
+
+Heatmap(as.matrix(x_sDUX[,2:3]), name="log2FPKM", col=c("white","red"),show_heatmap_legend = TRUE, cluster_columns =FALSE, cluster_row_slices=TRUE, show_row_dend=FALSE, width = unit(10, "mm")) +
+
+EnrichedHeatmap(mat_d5, col = col_fun_d5, name = "sDUX nodox",column_title = "sDUX ATAC\n nodox",
+                axis_name_rot = 90, pos_line=F,column_title_rot=90,
+                show_heatmap_legend = FALSE, top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col))),
+              use_raster=TRUE, raster_device="png",raster_quality=10) +
+  
+EnrichedHeatmap(mat_d6, col = col_fun_d6, name = "sDUX dox",column_title = "sDUX ATAC\n dox",
+                axis_name_rot = 90,pos_line=F,column_title_rot=90,show_heatmap_legend = TRUE,
+                top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col))),
+                use_raster=TRUE, raster_device="png", raster_quality=10) 
+  
+```
+
+
+#DUXA-VP64  alone
+```{r}
+x_DUXA_VP64<-data.frame(gene_id=deg_DUXA_VP64_up) %>% 
+  left_join(f_mean_lhcnm2[,c("gene_id","DUXA_VP64cont","DUXA_VP64dox")],by="gene_id") %>% 
+  left_join(res_DUXA_VP64[,c("gene_id","log2FoldChange")]) %>% 
+  arrange(desc(log2FoldChange)) %>% 
+  mutate(DUXA_VP64cont=log2(DUXA_VP64cont+0.1)) %>% 
+  mutate(DUXA_VP64dox=log2(DUXA_VP64dox+0.1)) 
+
+head(x_DUXA_VP64)
+nrow(x_DUXA_VP64)
+
+#x_DUXA_VP64<-x_DUXA_VP64[with(x_DUXA_VP64,order(DUXA_VP64dox/DUXA_VP64cont)),]
+length(temp_transcripts<-subset(transcripts,gene_id %in% x_DUXA_VP64$gene_id))
+temp_transcripts$size<-width(temp_transcripts)
+temp_transcripts<-temp_transcripts[with(temp_transcripts,order(-size))]
+length(temp_transcripts_dedup<-temp_transcripts[!duplicated(temp_transcripts$gene_id)])
+names(temp_transcripts_dedup)<-temp_transcripts_dedup$gene_id
+#temp_transcripts_dedup<-keepStandardChromosomes(temp_transcripts_dedup,pruning.mode = "coarse")
+length(temp_transcripts_dedup)
+temp_transcripts_dedup<-temp_transcripts_dedup[x_DUXA_VP64$gene_id]
+
+d5<-rtracklayer::import("atac_data/DuxAVP64_nodox_Thu_Jan_06_2022_1619.bigWig",selection=temp_transcripts_dedup+10000)
+d6<-rtracklayer::import("atac_data/DuxAVP64_plusdox_Thu_Jan_06_2022_1619.bigWig",selection=temp_transcripts_dedup+10000)
+
+mat_d5 = normalizeToMatrix(d5, temp_transcripts_dedup, value_column = "score",  extend = 10000, mean_mode = "w0", w = 50)
+mat_d6 = normalizeToMatrix(d6, temp_transcripts_dedup, value_column = "score",  extend = 10000, mean_mode = "w0", w = 50)
+
+col_fun_d5= colorRamp2(quantile(mat_d6, c(0, 0.99)), c("white", "darkblue"))
+col_fun_d6= colorRamp2(quantile(mat_d6, c(0, 0.99)), c("white", "darkblue"))
+
+
+Heatmap(as.matrix(x_DUXA_VP64[,2:3]), name="log2FPKM", col=c("white","red"),show_heatmap_legend = TRUE, cluster_columns =FALSE, cluster_row_slices=TRUE, show_row_dend=FALSE, width = unit(10, "mm")) +
+
+EnrichedHeatmap(mat_d5, col = col_fun_d5, name = "DUXA_VP64 nodox",column_title = "DUXA_VP64 ATAC\n nodox",
+                axis_name_rot = 90, pos_line=F,column_title_rot=90,
+                show_heatmap_legend = FALSE, 
+                top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col)),ylim = c(0, 2.0)),
+              use_raster=TRUE, raster_device="png",raster_quality=10) +
+  
+EnrichedHeatmap(mat_d6, col = col_fun_d6, name = "DUXA_VP64 dox",column_title = "DUXA_VP64 ATAC\n dox",
+                axis_name_rot = 90,pos_line=F,column_title_rot=90,show_heatmap_legend = TRUE,
+                top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col)),ylim = c(0, 2.0)),
+                use_raster=TRUE, raster_device="png", raster_quality=10) 
+  
+```
+
+
+### 091522 jump to here
+
+# Load Data
+```{r}
+(fls<-list.files("atac_data",pattern = "narrowPeak",full.names = T) %>% str_subset("_vs_",negate=T))
+
+
+fls_dux4<-str_which(fls,"DUX4")
+#length(atac_DUX4<-interset(narrowPeakToGRanges(fls[fls_dux4[1]]),narrowPeakToGRanges(fls[fls_dux4[2]])))
+#names(atac_DUX4)<-paste0("atac_DUX4_",formatC(1:length(atac_DUX4),width=5,format="d",flag="0"))
+length(atac_DUX4<-merge_replicates(narrowPeakToGRanges(fls[fls_dux4[1]]),narrowPeakToGRanges(fls[fls_dux4[2]]),name="atac_DUX4_"))
+
+fls_duxA<-str_which(fls,"DUXA_")
+#length(atac_DUXA<-interset(narrowPeakToGRanges(fls[fls_duxA[1]]),narrowPeakToGRanges(fls[fls_duxA[2]])))
+#names(atac_DUXA)<-paste0("atac_DUXA_",formatC(1:length(atac_DUXA),width=5,format="d",flag="0"))
+length(atac_DUXA<-merge_replicates(narrowPeakToGRanges(fls[fls_duxA[1]]),narrowPeakToGRanges(fls[fls_duxA[2]]),name="atac_DUXA_"))
+
+fls_duxAvp64<-str_which(fls,"DuxAVP64")
+#length(atac_DUXA_VP64<-interset(narrowPeakToGRanges(fls[fls_duxAvp64[1]]),narrowPeakToGRanges(fls[fls_duxAvp64[2]])))
+#names(atac_DUXA_VP64)<-paste0("atac_DUXA_VP64_",formatC(1:length(atac_DUXA_VP64),width=5,format="d",flag="0"))
+length(atac_DUXA_VP64<-merge_replicates(narrowPeakToGRanges(fls[fls_duxAvp64[1]]),narrowPeakToGRanges(fls[fls_duxAvp64[2]]),name="atac_DUXA_VP64_"))
+
+fls_sdux<-str_which(fls,"sDux")
+#length(atac_sDUX<-interset(narrowPeakToGRanges(fls[fls_sdux[1]]),narrowPeakToGRanges(fls[fls_sdux[2]])))
+#names(atac_sDUX)<-paste0("atac_sDUX_",formatC(1:length(atac_sDUX),width=5,format="d",flag="0"))
+length(atac_sDUX<-merge_replicates(narrowPeakToGRanges(fls[fls_sdux[1]]),narrowPeakToGRanges(fls[fls_sdux[2]]),name="atac_sDUX_"))
+
+length(composite<-reduce(c(atac_DUX4,atac_DUXA,atac_DUXA_VP64,atac_sDUX)))
+save(composite,atac_DUX4,atac_DUXA,atac_DUXA_VP64,atac_sDUX,file="atac_peaklists2.rdata")
+
+```
+
+# 3-way Venn
+```{r}
+  
+n1<-length(atac_DUX4) #a1
+n2<-length(atac_DUXA_VP64) #b2
+
+n3<-length(atac_sDUX)  #c3
+
+  
+  
+                              (n12=length(ab<-interset(atac_DUX4,atac_DUXA_VP64)))
+                            (n13=length(ac<-interset(atac_DUX4,atac_sDUX)))
+                           (n23=length(bc<-interset(atac_DUXA_VP64,atac_sDUX)))
+                           (n123=length(abc<-interset(atac_DUX4,bc)))
+#
+  (na<-length(ab<-ab[!(ab %over% atac_sDUX) & !(ab %over% abc)]))
+  (nc<-length(ac<-ac[!(ac %over% atac_DUXA_VP64) & !(ac %over% abc)]))
+#
+
+ length(atac_DUX4_only<-atac_DUX4[!(atac_DUX4 %over% atac_sDUX) & !(atac_DUX4 %over% atac_DUXA_VP64)])
+ length(atac_sDUX_only<-atac_sDUX[!(atac_sDUX %over% atac_DUXA_VP64) & !(atac_sDUX %over% atac_DUX4)])
+ length(atac_DUXA_VP64_only<-atac_DUXA_VP64[!(atac_DUXA_VP64 %over% atac_sDUX) & !(atac_DUXA_VP64 %over% atac_DUX4)])
+
+(VennDiag <- euler(c("atac_DUX4" = length(atac_DUX4_only), #area1-n12-n13+n123,
+                     "atac_DUXA_VP64" = length(atac_DUXA_VP64_only), #area2-n12-n23+n123,
+                     "atac_sDUX" = length(atac_sDUX_only), #area3-n13-n23+n123,
+                    "atac_DUX4&atac_DUXA_VP64" = na,
+                     "atac_DUX4&atac_sDUX" = nc,
+                    "atac_DUXA_VP64&atac_sDUX" = n23-n123,
+                    "atac_DUX4&atac_DUXA_VP64&atac_sDUX" = n123)))
+ 
+   svglite::svglite(paste0("DUX_ATAC_VENN_",ts,".svg"),width=9,height=8)                        
+  plot(VennDiag, quantities = TRUE, font=12, cex=10, alpha=0.5,
+       fill=cbPalette[c(5,7,6,4,2)],main="ATAC-seq Peaks")
+  dev.off()
+  
+
+```
+
+```{r}
+lengths(domains)
+transcripts$gene_id<-substr(transcripts$gene_id,1,15)
+d=10000
+
+find_associated_atac_peaks<-function(gr,dom) {
+  length(temp_transcripts<-subset(transcripts,gene_id %in% domains[[dom]]))
+  temp_transcripts$size<-width(temp_transcripts)
+  temp_transcripts<-temp_transcripts[with(temp_transcripts,order(-size))]
+  length(temp_transcripts<-temp_transcripts[!duplicated(temp_transcripts$gene_id)])
+  strand(temp_transcripts)<-"*"
+
+  length(gr_anno<-annotate_peaks(gr, tx = temp_transcripts, cutoff = Inf,collapse=F))
+  #length(unique(atac_sDUX_anno$gene_id))
+  #length(na.omit(unique(atac_sDUX_anno$gene_id)))
+  length(gr_anno<-subset(gr_anno,gr_anno$distancetoFeature <= d))
+  #length(unique(gr_anno$gene_id))
+  return(gr_anno)
+}
+
+#length(atac_DUX4_anno[atac_DUX4_anno %over% atac_sDUX])
+
+
+length(atac_D4AS<-find_associated_atac_peaks(abc,"D4AS"))
+table(atac_D4AS$num_mega<-countOverlaps(atac_D4AS,mega))
+length(atac_D4<-find_associated_atac_peaks(atac_DUX4[!atac_DUX4 %over% atac_sDUX & !atac_DUX4 %over% atac_DUXA_VP64],"D4"))
+length(atac_DS<-find_associated_atac_peaks(atac_sDUX[!atac_sDUX %over% atac_DUX4 & !atac_sDUX %over% atac_DUXA_VP64],"DS"))
+length(atac_DA<-find_associated_atac_peaks(atac_DUXA_VP64[!atac_DUXA_VP64 %over% atac_DUX4 & !atac_DUXA_VP64 %over% atac_sDUX],"DA"))
+
+
+length(atac_D4S<-find_associated_atac_peaks(ab,"D4S"))
+table(atac_D4S$num_mega<-countOverlaps(atac_D4S,mega))
+
+
+length(atac_D4A<-find_associated_atac_peaks(ac,"D4A"))
+table(atac_D4A$num_mega<-countOverlaps(atac_D4A,mega))
+
+
+length(atac_DAS<-find_associated_atac_peaks(bc,"DAS"))
+table(atac_DAS$num_mega<-countOverlaps(atac_DAS,mega))
+```
+
+# Make Tornado plot
+```{r}
+
+length(atac_D4)
+length(atac_DS)
+length(atac_D4S)
+length(atac_D4A)
+length(atac_D4_sample<-sample(atac_D4,100))
+length(atac_DS_sample<-sample(atac_DS,100))
+length(atac_D4S_sample<-sample(atac_D4S,100))
+length(atac_D4A_sample<-sample(atac_D4A,100))
+
+temp<-c(atac_DS_sample,
+        atac_D4_sample,
+        atac_DA,
+        atac_D4S_sample,
+        atac_D4A_sample,
+        atac_DAS,
+        atac_D4AS)
+        
+
+table(split<-factor(c(rep(paste0("atac_DS_sample\n",length(atac_DS_sample)," sites"),length(atac_DS_sample)),
+                      rep(paste0("atac_D4_sample\n",length(atac_D4_sample)," sites"),length(atac_D4_sample)),
+                      rep(paste0("atac_DA\n",length(atac_DA)," sites"),length(atac_DA)),
+                      rep(paste0("atac_D4S_sample\n",length(atac_D4S_sample)," sites"),length(atac_D4S_sample)),
+                      rep(paste0("atac_D4A_sample\n",length(atac_D4A_sample)," sites"),length(atac_D4A_sample)),
+                      rep(paste0("atac_DAS\n",length(atac_DAS)," sites"),length(atac_DAS)),
+                      rep(paste0("atac_D4AS\n",length(atac_D4AS)," sites"),length(atac_D4AS))),
+                    
+                    levels=c(paste0("atac_DS_sample\n",length(atac_DS_sample)," sites"),
+                             paste0("atac_D4_sample\n",length(atac_D4_sample)," sites"),
+                             paste0("atac_DA\n",length(atac_DA)," sites"),
+                             paste0("atac_D4S_sample\n",length(atac_D4S_sample)," sites"),
+                             paste0("atac_D4A_sample\n",length(atac_D4A_sample)," sites"),
+                             paste0("atac_DAS\n",length(atac_DAS)," sites"),
+                             paste0("atac_D4AS\n",length(atac_D4AS)," sites"))))
+
+
+
+temp.center<-peak_center(temp)
+
+d1<-rtracklayer::import("atac_data/Dux4_nodox_Thu_Jan_06_2022_1619.bigWig",selection=temp.center+5000)
+d2<-rtracklayer::import("atac_data/Dux4_plusdox_Thu_Jan_06_2022_1619.bigWig",selection=temp.center+5000)
+d3<-rtracklayer::import("atac_data/DuxAVP64_nodox_Thu_Jan_06_2022_1619.bigWig",selection=temp.center+5000)
+d4<-rtracklayer::import("atac_data/DuxAVP64_plusdox_Thu_Jan_06_2022_1619.bigWig",selection=temp.center+5000)
+d5<-rtracklayer::import("atac_data/sDux_nodox_Thu_Jan_06_2022_1619.bigWig",selection=temp.center+5000)
+d6<-rtracklayer::import("atac_data/sDux_plusdox_Thu_Jan_06_2022_1619.bigWig",selection=temp.center+5000)
+
+d1<-keepStandardChromosomes(d1)
+d2<-keepStandardChromosomes(d2)
+d3<-keepStandardChromosomes(d3)
+d4<-keepStandardChromosomes(d4)
+d5<-keepStandardChromosomes(d5)
+d6<-keepStandardChromosomes(d6)
+
+mat_d1 = normalizeToMatrix(d1, temp.center, value_column = "score",  extend = 5000, mean_mode = "w0", w = 50)
+mat_d2 = normalizeToMatrix(d2, temp.center, value_column = "score",  extend = 5000, mean_mode = "w0", w = 50)
+mat_d3 = normalizeToMatrix(d3, temp.center, value_column = "score",  extend = 5000, mean_mode = "w0", w = 50)
+mat_d4 = normalizeToMatrix(d4, temp.center, value_column = "score",  extend = 5000, mean_mode = "w0", w = 50)
+mat_d5 = normalizeToMatrix(d5, temp.center, value_column = "score",  extend = 5000, mean_mode = "w0", w = 50)
+mat_d6 = normalizeToMatrix(d6, temp.center, value_column = "score",  extend = 5000, mean_mode = "w0", w = 50)
+
+col_fun_d1= colorRamp2(quantile(mat_d2, c(0, 0.99)), c("white", "darkblue"))
+col_fun_d2= colorRamp2(quantile(mat_d2, c(0, 0.99)), c("white", "darkblue"))
+col_fun_d3= colorRamp2(quantile(mat_d4, c(0, 0.99)), c("white", "darkblue"))
+col_fun_d4= colorRamp2(quantile(mat_d4, c(0, 0.99)), c("white", "darkblue"))
+col_fun_d5= colorRamp2(quantile(mat_d6, c(0, 0.99)), c("white", "darkblue"))
+col_fun_d6= colorRamp2(quantile(mat_d6, c(0, 0.99)), c("white", "darkblue"))
+
+#col=c("blue","green","red","black","red","black","green")
+col<-cbPalette[c(3,4,7,1,2,6,8)]
+
+svglite::svglite(paste0("DUX_ATAC_SEQ_heatmap_",ts,".svg"),width=9,height=8)
+EnrichedHeatmap(mat_d1, col = col_fun_d1, name = "DUX4 nodox",column_title = "DUX4\n nodox",
+                axis_name_rot = 90,split=split, pos_line=F,column_title_rot=0,row_title_rot=0,row_title_gp = gpar(fontsize = 12, col=col),
+                show_heatmap_legend = FALSE, top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col),ylim = c(0, 1.25))),
+              use_raster=TRUE, raster_device="png",raster_quality=10,axis_name= c("-5Kb","Center","+5Kb")) +
+  
+EnrichedHeatmap(mat_d2, col = col_fun_d2, name = "DUX4 dox",column_title = "DUX4\n dox",
+                axis_name_rot = 90,split=split,pos_line=F,column_title_rot=0,row_title_rot=0,row_title_gp = gpar(fontsize = 12, col=col),
+                show_heatmap_legend = TRUE,top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col), ylim = c(0, 1.25))),
+                use_raster=TRUE, raster_device="png", raster_quality=10,axis_name= c("-5Kb","Center","+5Kb")) +
+  
+EnrichedHeatmap(mat_d5, col = col_fun_d5, name = "sDUX nodox",column_title = "sDUX\n nodox",
+ axis_name_rot = 90,split=split, pos_line=F,column_title_rot=0,row_title_rot=0,row_title_gp = gpar(fontsize = 12, col=col),
+                show_heatmap_legend = FALSE, top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col),ylim = c(0, 1.25))),
+              use_raster=TRUE, raster_device="png",raster_quality=10,axis_name= c("-5Kb","Center","+5Kb")) +
+  
+EnrichedHeatmap(mat_d6, col = col_fun_d6, name = "sDUX dox",column_title = "sDUX\n dox",
+                axis_name_rot = 90,split=split,pos_line=F,column_title_rot=0,row_title_rot=0,row_title_gp = gpar(fontsize = 12, col=col),
+                show_heatmap_legend = TRUE,top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col), ylim = c(0, 1.25))),
+                use_raster=TRUE, raster_device="png", raster_quality=10,axis_name= c("-5Kb","Center","+5Kb")) +
+  
+EnrichedHeatmap(mat_d3, col = col_fun_d3, name = "DUXAVP64 nodox",column_title = "DUXA-VP64\n nodox",
+                axis_name_rot = 90,split=split, pos_line=F,column_title_rot=0,row_title_rot=0,row_title_gp = gpar(fontsize = 12, col=col),
+                show_heatmap_legend = FALSE, top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col),ylim = c(0, 1.25))),
+              use_raster=TRUE, raster_device="png",raster_quality=10,axis_name= c("-5Kb","Center","+5Kb")) +
+  
+EnrichedHeatmap(mat_d4, col = col_fun_d4, name = "DUXAVP64 dox",column_title = "DUXA-VP64\n dox",
+                axis_name_rot = 90,split=split,pos_line=F,column_title_rot=0,row_title_rot=0,row_title_gp = gpar(fontsize = 12, col=col),
+                show_heatmap_legend = TRUE,top_annotation = HeatmapAnnotation(lines = anno_enriched(gp = gpar(col = col), ylim = c(0, 1.25))),
+                use_raster=TRUE, raster_device="png", raster_quality=10,axis_name= c("-5Kb","Center","+5Kb"))
+  
+dev.off()
+
+
+
+```
+
+# get log2
+```{r}
+
+rbind(
+  data.frame(domain="DS",res="sDUX",lfc=subset(res_sDUX,gene_id %in% unique(atac_DS$gene_id))$sDUXdox),
+  data.frame(domain="D4",res="DUX4",lfc=subset(res_DUX4,gene_id %in% unique(atac_D4$gene_id))$DUX4dox),
+  data.frame(domain="DA",res="DUXA-VP64",lfc=subset(res_DUXA_VP64,gene_id %in% unique(atac_DA$gene_id))$DUXA_VP64dox),
+  data.frame(domain="D4S",res="sDUX",lfc=subset(res_sDUX,gene_id %in% unique(atac_D4S$gene_id))$sDUXdox),
+  data.frame(domain="D4S",res="DUX4",lfc=subset(res_DUX4,gene_id %in% unique(atac_D4S$gene_id))$DUX4dox),
+  data.frame(domain="D4A",res="DUX4",lfc=subset(res_DUX4,gene_id %in% unique(atac_D4A$gene_id))$DUX4dox),
+  data.frame(domain="D4A",res="DUXA-VP64",lfc=subset(res_DUXA_VP64,gene_id %in% unique(atac_D4A$gene_id))$DUXA_VP64dox),
+  data.frame(domain="DAS",res="sDUX",lfc=subset(res_sDUX,gene_id %in% unique(atac_DAS$gene_id))$sDUXdox),
+  data.frame(domain="DAS",res="DUXA-VP64",lfc=subset(res_DUXA_VP64,gene_id %in% unique(atac_DAS$gene_id))$DUXA_VP64dox),
+  data.frame(domain="D4AS",res="sDUX",lfc=subset(res_sDUX,gene_id %in% unique(atac_D4AS$gene_id))$sDUXdox),
+  data.frame(domain="D4AS",res="DUX4",lfc=subset(res_DUX4,gene_id %in% unique(atac_D4AS$gene_id))$DUX4dox),
+  data.frame(domain="D4AS",res="DUXA-VP64",lfc=subset(res_DUXA_VP64,gene_id %in% unique(atac_D4AS$gene_id))$DUXA_VP64dox)
+) %>% 
+  dplyr::mutate(domain=factor(domain,levels=c("DS","D4","DA","D4S","D4A","DAS","D4AS"))) %>% 
+  dplyr::mutate(res=factor(res,levels=c("sDUX","DUX4","DUXA-VP64"))) %>% 
+  dplyr::mutate(lfc=log2(lfc)) %>% 
+  ggplot(aes(x=domain,y=lfc,color=res)) +
+  geom_boxplot() + theme_bw() + ylab(" Log2 (FPKM)")
+  scale_color_manual(values=cbPalette[c(3,4,7,1,2,6,8)])
+
+
+
+
+```
+
+```{r}
+atac_D4$num_class <- factor(case_when(
+    atac_D4$num_mega == 0 ~ "0",
+    atac_D4$num_mega == 1 ~ "1",
+    atac_D4$num_mega == 2 ~ "2",
+    atac_D4$num_mega == 3 ~ "3",
+    atac_D4$num_mega == 4 | atac_D4$num_mega == 5 ~ "4-5",
+    atac_D4$num_mega >= 6 & atac_D4$num_mega <= 8 ~ "6-8",
+    atac_D4$num_mega >= 9 & atac_D4$num_mega <= 11  ~ "9-11",
+    atac_D4$num_mega >= 12 & atac_D4$num_mega <= 15  ~ "12-15",
+    atac_D4$num_mega >= 16 & atac_D4$num_mega <= 20  ~ "16-20",
+    atac_D4$num_mega >= 21 & atac_D4$num_mega <= 30  ~ "21-30",
+    atac_D4$num_mega >= 31 & atac_D4$num_mega <= 40 ~ "31-40"
+  ),levels=c("0","1","2","3","4-5","6-8","9-11","12-15","16-20","21-30","31-40"))
+
+atac_D4$induced_FPKM<-f_mean_lhcnm2[match(atac_D4$gene_id,f_mean_lhcnm2$gene_id),"DUX4dox"]
+
+temp<-mcols(atac_D4) 
+temp<-temp[with(temp,order(-num_mega)),]
+temp<-temp[!duplicated(temp$gene_id),]
+
+temp %>% 
+  as.data.frame() %>% 
+  dplyr::mutate(log2FPKM=log2(induced_FPKM)) %>% 
+ggplot(aes(x=num_class,y=log2FPKM)) + geom_quasirandom(method = "tukeyDense") +
+  xlab("Number of Motifs per ATAC Peak") + theme_bw() + ggtitle("DUX4 Targets with ATAC Peaks")
+
+
+```
+
+```{r}
+gr<-c(GRanges(seqnames="chr19",IRanges(start=57647300,end=57680992),strand="*"),
+      GRanges(seqnames="chr1",IRanges(start=12769498,end=12780305),strand="*"),
+      GRanges(seqnames="chr2",IRanges(start=95558378,end=956085003),strand="*"))
+
+  sites<-mega[mega %over% gr]
+  length(sites)
+  sites$wls<-wls(sites)
+  sites<-sites[!duplicated(sites$wls)]
+  length(sites)
+  sites.dna<-getSeq(BSgenome.Hsapiens.UCSC.hg38,sites)
+ sites$class<-case_when(
+  subseq(sites.dna,2,2) == "A" & subseq(sites.dna,10,10) == "C"  ~ "DUX4-like",
+  subseq(sites.dna,2,2) == "A" & subseq(sites.dna,10,10) == "T"  ~ "P3-like",
+  subseq(sites.dna,2,2) == "A" & subseq(sites.dna,10,10) == "A"  ~ "RR",
+  subseq(sites.dna,2,2) == "A" & subseq(sites.dna,10,10) == "G"  ~ "RR",
+  subseq(sites.dna,2,2) == "G" & subseq(sites.dna,10,10) == "C"  ~ "mDux-like",
+  subseq(sites.dna,2,2) == "G" & subseq(sites.dna,10,10) == "T"  ~ "DUX4-like",
+  subseq(sites.dna,2,2) == "G" & subseq(sites.dna,10,10) == "G"  ~ "RR",
+  subseq(sites.dna,2,2) == "G" & subseq(sites.dna,10,10) == "A"  ~ "RR",
+  subseq(sites.dna,2,2) == "C" & subseq(sites.dna,10,10) == "C"  ~ "YY",
+  subseq(sites.dna,2,2) == "C" & subseq(sites.dna,10,10) == "T"  ~ "YY",
+  subseq(sites.dna,2,2) == "C" & subseq(sites.dna,10,10) == "G"  ~ "mDux-like",
+  subseq(sites.dna,2,2) == "C" & subseq(sites.dna,10,10) == "A"  ~ "DUX4-like",
+  subseq(sites.dna,2,2) == "T" & subseq(sites.dna,10,10) == "C"  ~ "YY",
+  subseq(sites.dna,2,2) == "T" & subseq(sites.dna,10,10) == "T"  ~ "YY",
+  subseq(sites.dna,2,2) == "T" & subseq(sites.dna,10,10) == "G"  ~ "DUX4-like",
+  subseq(sites.dna,2,2) == "T" & subseq(sites.dna,10,10) == "A"  ~ "P3-like",
+  TRUE ~ "huh?"
+               )
+names(sites)<-sites$class
+table(sites$class)
+export(sites[sites$class=="DUX4-like"],"class_d4.bed",trackLine=new("TrackLine", name="DUX4-like", color=col2rgb(cbPalette[4])[,1]))
+export(sites[sites$class=="mDUX-like"],"class_da.bed",trackLine=new("TrackLine", name="mDUX-like", color=col2rgb(cbPalette[8])[,1]))
+export(sites[sites$class=="P3-like"],"class_p3.bed",trackLine=new("TrackLine", name="P3-like", color=col2rgb(cbPalette[8])[,1]))
+
+```
+
+
+```{r}
+(fls_neg<-list.files("negpeaks",pattern = "narrowPeak",full.names = T) )
+fls_neg[fls_neg_duxA<-str_which(fls_neg,"DUXA_")]
+length(atac_neg_DUXA<-merge_replicates(narrowPeakToGRanges(fls_neg[fls_neg_duxA[1]]),narrowPeakToGRanges(fls_neg[fls_neg_duxA[2]]),name="atac_neg_DUXA_"))
+
+fls_neg[fls_neg_dux4<-str_which(fls_neg,"DUX4_")]
+length(atac_neg_DUX4<-merge_replicates(narrowPeakToGRanges(fls_neg[fls_neg_dux4[1]]),narrowPeakToGRanges(fls_neg[fls_neg_dux4[2]]),name="atac_neg_DUX4_"))
+
+a<-narrowPeakToGRanges(fls_neg[fls_neg_dux4[1]])
+b<-narrowPeakToGRanges(fls_neg[fls_neg_dux4[1]])
+neg_dux4<-reduce(c(a,b))
+neg_dux4<-neg_dux4[neg_dux4 %over% a & neg_dux4 %over% b]
+length(neg_dux4)
+
+table(atac_neg_DUXA %over% neg_dux4)
+
+table(atac_neg_DUXA %over% atac_DUX4)
+
+atac_neg_DUXA[atac_neg_DUXA %over% atac_DUX4]
+
+
+atac_neg_DUXA<-atac_neg_DUXA[!atac_neg_DUXA %over% neg_dux4]
+length(temp_transcripts<-subset(transcripts,gene_id %in% deg_DUX4_up))
+temp_transcripts$size<-width(temp_transcripts)
+temp_transcripts[grep("KIF1B",temp_transcripts$symbol)]
+temp_transcripts<-temp_transcripts[with(temp_transcripts,order(-size))]
+length(temp_transcripts_dedup<-temp_transcripts[!duplicated(temp_transcripts$gene_id)])
+temp_transcripts_dedup[grep("KIF1B",temp_transcripts_dedup$symbol)]
+strand(temp_transcripts_dedup)<-"*"
+names(temp_transcripts_dedup)<-temp_transcripts_dedup$gene_id
+
+length(atac_neg_DUXA_anno<-annotate_peaks(atac_neg_DUXA, tx = temp_transcripts_dedup, cutoff = Inf,collapse=F))
+atac_neg_DUXA_anno<-atac_neg_DUXA_anno[!is.na(atac_neg_DUXA_anno$distancetoFeature)]
+length(na.omit(unique(atac_neg_DUXA_anno$gene_id)))
+length(atac_neg_DUXA_anno[atac_neg_DUXA_anno$distancetoFeature <= 50000,])
+
+length(atac_neg_DUXA_anno<-atac_neg_DUXA_anno[abs(atac_neg_DUXA_anno$distancetoFeature) <= 50000,])
+length(unique(atac_neg_DUXA_anno$gene_id))
+
+View(as.data.frame(atac_neg_DUXA_anno))
+
+length(expressed_genes<-res_DUX4[res_DUX4$baseMean > 10,]$gene_id)
+length(deg_DUX4_up)
+length(unique(atac_neg_DUXA_anno[atac_neg_DUXA_anno$distancetoFeature <= 10000,]$gene_id))
+```
+
+```{r}
+length(atac_neg_DUXA_anno<-annotate_peaks(atac_neg_DUXA, tx = temp_transcripts_dedup, cutoff = Inf,collapse=F))
+
+
+n1<-length(atac_DUX4) #a1
+n2<-length(atac_DUXA_VP64) #b2
+
+n3<-length(atac_sDUX)  #c3
+
+atac_DUXA_VP64_anno<-annotate_peaks(atac_DUXA_VP64, tx = temp_transcripts_dedup, cutoff = Inf,collapse=T)
+mcols(atac_DUXA_VP64_anno)<-mcols(atac_DUXA_VP64_anno)[,c("score","genes")]
+
+atac_DUX4_anno<-annotate_peaks(atac_DUX4, tx = temp_transcripts_dedup, cutoff = Inf,collapse=T)
+mcols(atac_DUX4_anno)<-mcols(atac_DUX4_anno)[,c("score","genes")]
+
+atac_sDUX_anno<-annotate_peaks(atac_sDUX, tx = temp_transcripts_dedup, cutoff = Inf,collapse=T)
+mcols(atac_sDUX_anno)<-mcols(atac_sDUX_anno)[,c("score","genes")]
+
+writexl::write_xlsx(list(as.data.frame(atac_DUX4_anno),
+                         as.data.frame(atac_DUXA_VP64_anno),
+                         as.data.frame(atac_sDUX_anno)),paste0("ATAC_DUX_Peaks_",ts,".xlsx"))
+```
+
